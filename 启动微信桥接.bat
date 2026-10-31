@@ -40,7 +40,7 @@ echo     Jingjing - WeChat 4.x bridge
 echo   ==========================================
 echo.
 echo   Need: WeChat 4.x is running AND logged in.
-echo   Need: whale server is running (launch the other bat first).
+echo   Whale server: auto-started if 127.0.0.1:8787 is not listening.
 echo.
 echo   Press Ctrl+C to stop.
 echo.

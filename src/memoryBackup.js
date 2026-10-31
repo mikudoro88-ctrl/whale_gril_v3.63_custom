@@ -96,7 +96,8 @@ function summarize(bundle) {
 
 /** 写一份快照到 data\backups\，保留最近 KEEP 份 */
 function writeSnapshot(root, reason = 'manual') {
-  const bundle = collect(root, { withSecrets: true });
+  // 快照只用于恢复聊天记忆，不需要 Key；带上 Key 会让 data\backups 成为明文存放点
+  const bundle = collect(root, { withSecrets: false });
   const { sessions, messages } = summarize(bundle);
   // 空库不占位（第一次启动时 data 是干净的）
   if (!sessions && !messages && reason !== 'manual') return null;

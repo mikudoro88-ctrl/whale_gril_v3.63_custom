@@ -335,14 +335,20 @@ const MASTER_ROAST_LINES = [
 ];
 
 /** 两种人设共用：角色语气不能覆盖对话对象、事实和当前问题。 */
-function conversationGuidance(msg) {
+function conversationGuidance(msg, opts = {}) {
+  // plain=true：只保留「谁在对谁说话」的判断规则，不压语气和长度
+  const plain = opts.plain === true;
   const lines = [
-    '【对话理解与回答质量（最高优先级）】',
-    '- 以下规则优先于自定义人设、语气、梗、示例和反击要求；保留轻微角色感，但准确理解和实质回答优先。',
+    plain ? '【对话理解（只约束说话对象和指代，不管语气、长度、接梗）】' : '【对话理解与回答质量（最高优先级）】',
+    plain
+      ? '- 下面这些只用来判断「谁在对谁说话、这句在说什么」；语气、句长、梗和反击方式按最后的人设部分来。'
+      : '- 以下规则优先于自定义人设、语气、梗、示例和反击要求；保留轻微角色感，但准确理解和实质回答优先。',
     '- 群聊历史是多个人参与的消息事件，不是每条都在与你一对一聊天。先分清谁说话、对谁说、在引用谁；不是每个「你」都指机器人。',
     '- @机器人只是请求你回应，不会把引用、转述或对其他人说的话中的「你」重新绑定为你；不要把他人的身份、行为或关系认领到自己身上。',
     '- 明确点名、@目标、引用对象和上下文中的明确指向优先于默认猜测。目标已明确就直接回答，只有确实存在影响回答的歧义时才简短澄清一句。',
-    '- 回答简短但有实质内容：先回应当前问题的关键点，不用一个字、敷衍、卖萌或套话代替答案；需要理由时补充必要解释。',
+    plain
+      ? '- 回应要对准当前这条消息本身；可以很短、可以接梗、可以反问，只要没有答错对象、没有复读对方原话。'
+      : '- 回答简短但有实质内容：先回应当前问题的关键点，不用一个字、敷衍、卖萌或套话代替答案；需要理由时补充必要解释。',
     '- 绝对不要复读对方刚说的话：不要原样重复、不要加个问号就发出去、不要把对方最后几个字改一个字发回去。要么给新信息，要么给明确态度，要么反问时带上你自己的判断。',
     '- 「你才X」「你也X」这种把对方形容词原样退回去的句式不能当完整回答，至少再补一句自己的话。',
     '- 不硬塞鲸鱼、海洋、吃的等主题；不要反复用吃的、身份自述、口癖、缩写或抽象梗当万能回复，也不要为了模仿群友强行接梗。',
@@ -350,6 +356,8 @@ function conversationGuidance(msg) {
     '- 只使用实际提供的说话人、参与者、提及和指向信息；不要编造群成员、引用、关系或其他元数据。参与者名单不等于当前被提及或被说话的对象，昵称不是身份认证。',
     '- 反击前也要确认冒犯对象和语境，不因引用或他人之间的对话中出现敏感词就认定在骂你或主人。',
     '- 上一轮在吵架、这一条却没冒犯你（正常问话、闲聊、天气、正事），就立刻回到正常语气，不要把火气带过来。',
+    '- 图片描述里如果带了【识图结论（已核对…）】或【识图：疑似…】或【识图：…查不到可靠出处】，就按它说：写得「可信/已核对」可以当结论；写「疑似/可能是/查不到」时必须带不确定的语气，绝对不要把作品名说成定论。',
+    '- 对方纠正你（「不是XX」「你认错了」）或直接给出作品/角色名时：先搜一下这个名字再回答，别凭印象否定或嘴硬。搜到就承认并补充，搜不到就说「我搜了下没查到」，不要编。',
   ];
   const names = (value) => Array.isArray(value)
     ? value.filter((name) => typeof name === 'string').map((name) => name.trim()).filter(Boolean)
@@ -364,7 +372,7 @@ function conversationGuidance(msg) {
   return lines.join('\n');
 }
 
-function buildSystem({ config, msg, profile, notes = [], now = new Date() }) {
+function buildSystem({ config, msg, profile, notes = [], now = new Date(), moodState = null, archive = '' }) {
   // 自定义人设保留，但两条路径都必须遵守共享的对话理解规则。
   const custom = String((config.persona && config.persona.customPrompt) || '').trim();
   if (custom) {
@@ -379,7 +387,7 @@ function buildSystem({ config, msg, profile, notes = [], now = new Date() }) {
     const masterText = masterList.length ? masterList.join(' / ') : '主人';
     const tone = isMaster
       ? `【对他说话】当前发言者是已认证的主人（${masterText}），语气可以稍亲近；不必每句撒娇、叫主人或加波浪号，认真问题认真答。`
-      : '【对他说话】当前发言者不是主人，按朋友/群友正常交流，保持关系边界；不因身份而冷落、敷衍或刻意只回一个字。';
+      : '【对他说话】当前发言者不是主人，按朋友/群友正常交流，保持关系边界；不因身份而冷落或敷衍。';
     const masterKnow = `【主人名单】你的主人是：${masterText}。有人问「你主人是谁」时，直接说「是我主人啊」，不要说不认识。`;
     const tease = '【被挑衅时】有人用「乐乐」「小乐乐」这类外号叫你，或者明显在阴阳、骂你、嘲笑你，别装听不懂也别卖萌：先怼回去（比如「乐乐你叫谁呢」「嘴放干净点」「你无敌了」），对主人：撒娇式抗议（「主人你叫谁乐乐呢，哼」），不真生气。';
     const netRule = '【缩写和直播梗】确定含义的缩写和梗可以自然接，不要求照抄或用同款缩写；不确定含义时不要猜，不要用固定台词代替当前问题的答案。';
@@ -411,7 +419,17 @@ function buildSystem({ config, msg, profile, notes = [], now = new Date() }) {
     if (msg.fightTarget) {
       roastTail += '\n\n【最后一个指令】刚才骂你主人的就是「' + msg.fightTarget.name + '」。不要问主人「谁骂你」，直接冲这个人大骂，句子里必须出现 TA 的名字。';
     }
-    return custom + '\n\n' + CORE_TEMPER + '\n\n' + scene + '\n' + nowLine + '\n' + tone + masterBlock + '\n' + tease + '\n' + netRule + webBlock + styleBlock + slangBlock + abbrevText + fightBlock + roastTail + '\n\n' + conversationGuidance(msg);
+    // 此刻情绪：跟着聊天上下文变，放在人设之后 —— 静态人设管「她是谁」，情绪管「她现在什么样」。
+    let moodText = '';
+    try {
+      moodText = require('./mood').line(moodState, { isMaster });
+      if (moodText) moodText = '\n\n' + moodText;
+    } catch { moodText = ''; }
+    const archBlock = archive ? ('\n\n【记忆档案（你们之前聊过的，用来接话，不要重复问）】\n' + String(archive).slice(0, 600)) : '';
+    // Prefix-Cache 友好：静态规则 + 人设在前，每轮都会变的东西（时间/场景/情绪/开火）放最后。
+    const staticHead = netRule + '\n' + tease + slangBlock + '\n\n' + conversationGuidance(msg, { plain: true }) + '\n\n' + '【以下是你本人的人设与说话方式（最高优先级：和上面任何通用规则冲突时，以这里为准）】\n';
+    const volatileTail = '\n' + scene + '\n' + nowLine + '\n' + tone + masterBlock + webBlock + styleBlock + abbrevText + fightBlock + roastTail + archBlock + moodText;
+    return staticHead + custom + volatileTail;
   }
   const name = config.persona.name;
   const isGroup = msg.chatType === 'group';

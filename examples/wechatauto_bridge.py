@@ -77,6 +77,33 @@ CARE_QUIET_MIN = 20.0
 # Fail closed even when an earlier setting makes startup config parsing fail.
 STICKER_TEST_ON = False
 
+# 表情包彩蛋：收到表情包时按概率回一句「服务器繁忙，请稍后重试」，其余时候照旧不说话。
+# 概率和文案在 config.json 的 wechat.stickerBusy 里调，chance=0 就是关掉。
+STICKER_BUSY_CHANCE = 0.3
+STICKER_BUSY_TEXT = "服务器繁忙，请稍后重试"
+# 同一个会话最多 5 分钟一次，免得对方连发表情包时被这句刷屏
+STICKER_BUSY_COOLDOWN = 300.0
+_sticker_busy_at = {}
+
+# 收到图片先问「想让我拿这张图做什么」，等对方下一句话再决定怎么处理。
+# 私聊直接问；群聊先 @ 发图的人再问。TTL 内没等到下一句就丢弃这张图。
+IMAGE_ASK_ENABLED = True
+IMAGE_ASK_TTL = 90.0
+IMAGE_CALL_TTL = 90.0
+IMAGE_ASK_PRIVATE = "收到图片啦～想让我拿这张图做什么？"
+IMAGE_ASK_GROUP = "想让我拿这张图做什么？"
+PENDING_IMAGE = {}
+# 群聊里 @ 人：默认用「纯文本 @昵称」；UI 选成员偶尔会卡死 40 秒，触发发送看门狗强制重启桥接
+AT_UI_MODE = False
+# 群里纯文本 @ 用的名字：config 里可以按 wxid 手工指定群昵称（优先），
+# 没指定就退到群成员备注/昵称（微信 4.x 本机库里没有独立的「群昵称」字段）。
+GROUP_NICK_MAP = {}
+DOC_NO_SEARCH = True
+# 文档/聊天截图类：用户要总结、提取、翻译时，只让模型读图上的字，不走联网搜图
+DOC_IMAGE_PROMPT = ("逐字转写这张图片里的全部文字（保留原有的分段、换行、编号和列表；"
+                    "聊天截图要分清左侧对方和右侧本人）。只输出图片上的文字内容，"
+                    "不要总结、不要评论、不要补充常识、不要联网搜索。")
+
 
 def _as_bool(value, default=False):
     """配置里的布尔：兼容写成字符串 "false" 的老配置。
@@ -91,6 +118,48 @@ def _as_bool(value, default=False):
     if isinstance(value, (int, float)):
         return value != 0
     return str(value).strip().lower() in ("1", "true", "yes", "on", "开")
+
+
+# ---------------------------------------------------------------- 收到视频链接：下完整视频再发回去
+VIDEO_LINK_ENABLED = True
+VIDEO_LINK_MAX_MB = 100.0
+VIDEO_LINK_QN = 64
+VIDEO_LINK_COOLDOWN = 300.0
+VIDEO_SKIP_SEARCH_FALLBACK = True   # 发视频时不退搜索框：会话列表打不开就放弃发送
+VIDEO_DELETE_AFTER_SEND = True   # 视频发出去后删掉本地文件，省磁盘（关掉就留着复用/排查）
+_video_link_at = {}
+_video_link_lock = threading.Lock()
+_VIDEO_LINK_RE = re.compile(
+    r"https?://(?:www\.|m\.)?bilibili\.com/video/(?:BV[0-9A-Za-z]{10}|av\d+)[^\s\"'<>）)]*"
+    r"|https?://b23\.tv/[0-9A-Za-z]+", re.I)
+
+
+def _resolve_video_url(url):
+    """b23.tv 短链要跟一次跳转才知道是哪个 BV。"""
+    u = str(url or "")
+    if "b23.tv" not in u:
+        return u
+    try:
+        r = LOCAL_HTTP.get(u, headers={"User-Agent": _SHARE_UA}, allow_redirects=True, timeout=10)
+        return r.url or u
+    except Exception:
+        return u
+
+
+def video_link_bvids(text):
+    """从一段文字里找出 B 站视频链接，返回 [(link, bvid), ...]（按出现顺序去重）。"""
+    out, seen = [], set()
+    try:
+        urls = _VIDEO_LINK_RE.findall(str(text or ""))
+    except Exception:
+        urls = []
+    for raw in urls:
+        link = _resolve_video_url(raw)
+        bv = _bili_bvid(link)
+        if bv and bv not in seen:
+            seen.add(bv)
+            out.append((link, bv))
+    return out
 
 
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
@@ -136,7 +205,32 @@ try:
     _share = _cfg.get("share") or {}
     SHARE_ENABLED = bool(_share.get("enabled", True))
     SHARE_EVERY = float(_share.get("everyMinutes", 120))
+    SHARE_SEND_VIDEO = bool(_share.get("sendVideo", True))
+    try:
+        SHARE_VIDEO_MAX_MB = float(_share.get("videoMaxMB", 50))
+    except Exception:
+        SHARE_VIDEO_MAX_MB = 50.0
+    try:
+        SHARE_VIDEO_QN = int(_share.get("quality", 64))
+    except Exception:
+        SHARE_VIDEO_QN = 64
+    _vlink = _wechat.get("videoLink") or {}
+    VIDEO_LINK_ENABLED = _as_bool(_vlink.get("enabled", True), True)
+    try:
+        VIDEO_LINK_MAX_MB = float(_vlink.get("maxMB", 100))
+    except Exception:
+        VIDEO_LINK_MAX_MB = 100.0
+    try:
+        VIDEO_LINK_QN = int(_vlink.get("quality", 64))
+    except Exception:
+        VIDEO_LINK_QN = 64
+    try:
+        VIDEO_LINK_COOLDOWN = max(30.0, float(_vlink.get("cooldownSec", 300)))
+    except Exception:
+        VIDEO_LINK_COOLDOWN = 300.0
     # 主动搭话（问「在干啥 / 累不累」）。时间窗和频率由服务端 /api/care/due 算，这里只留一个开关和静默期
+    VIDEO_SKIP_SEARCH_FALLBACK = _as_bool(_vlink.get("noSearchFallback", True), True)
+    VIDEO_DELETE_AFTER_SEND = _as_bool(_vlink.get("deleteAfterSend", True), True)
     _care = _cfg.get("care") or {}
     # 主动搭话默认关（群里突然打招呼很社死）；就算开了也只私聊，除非显式 allowGroups
     CARE_ENABLED = bool(_care.get("enabled", False))
@@ -148,6 +242,25 @@ try:
     DIGEST_MINUTES = float(_digest) if isinstance(_digest, (int, float)) else 30.0
     # 表情包（实验性）：总闸在 features.stickers。关着就不轮询、不发图、日志一句不提。
     STICKER_TEST_ON = _as_bool(((_cfg.get("features") or {}).get("stickers", False)), False)
+    _sb = _wechat.get("stickerBusy") or {}
+    try:
+        STICKER_BUSY_CHANCE = max(0.0, min(1.0, float(_sb.get("chance", STICKER_BUSY_CHANCE))))
+    except Exception:  # noqa: BLE001
+        pass
+    STICKER_BUSY_TEXT = str(_sb.get("text") or STICKER_BUSY_TEXT).strip() or STICKER_BUSY_TEXT
+    _ia = _wechat.get("imageAsk") or {}
+    IMAGE_ASK_ENABLED = _as_bool(_ia.get("enabled", IMAGE_ASK_ENABLED), IMAGE_ASK_ENABLED)
+    DOC_NO_SEARCH = _as_bool(_ia.get("docNoSearch", DOC_NO_SEARCH), DOC_NO_SEARCH)
+    try:
+        IMAGE_ASK_TTL = max(30.0, float(_ia.get("ttlSec", IMAGE_ASK_TTL)))
+        IMAGE_CALL_TTL = max(30.0, float(_ia.get("callTtlSec", IMAGE_CALL_TTL)))
+    except Exception:  # noqa: BLE001
+        pass
+    IMAGE_ASK_PRIVATE = str(_ia.get("privateText") or IMAGE_ASK_PRIVATE).strip() or IMAGE_ASK_PRIVATE
+    IMAGE_ASK_GROUP = str(_ia.get("groupText") or IMAGE_ASK_GROUP).strip() or IMAGE_ASK_GROUP
+    AT_UI_MODE = _as_bool(_ia.get("atUi", AT_UI_MODE), AT_UI_MODE)
+    _gn = _ia.get("groupNicknames")
+    GROUP_NICK_MAP = {str(k): str(v) for k, v in _gn.items()} if isinstance(_gn, dict) else {}
     MASTER_WXID = (((_cfg.get("persona") or {}).get("master") or {}).get("wxids") or [''])[0]
 except Exception as _cfg_err:                  # noqa: BLE001
     # 别再静默吞掉：整块跳过 = 上面这些开关全部保持默认值，表现成「配置改了没用」。
@@ -198,8 +311,11 @@ def reload_config(path=None):
     """
     global GAME_TOKENS, AWAY_NOTICE, RETURN_NOTICE, QUEUED_MAX_AGE, QUEUED_MAX_CHATS
     global QUOTE_REPLY, KEYBOARD_FALLBACK, BACKGROUND_SEND, LOW_BATTERY_PCT, GOODNIGHT_TEXT
-    global ACCOUNT_GUARD, WINDOW_HWND, STICKER_TEST_ON
+    global ACCOUNT_GUARD, WINDOW_HWND, STICKER_TEST_ON, STICKER_BUSY_CHANCE, STICKER_BUSY_TEXT
+    global IMAGE_ASK_ENABLED, IMAGE_ASK_TTL, IMAGE_CALL_TTL, IMAGE_ASK_PRIVATE, IMAGE_ASK_GROUP, DOC_NO_SEARCH, AT_UI_MODE, GROUP_NICK_MAP
     global SHARE_ENABLED, SHARE_EVERY, CARE_ENABLED, CARE_QUIET_MIN, DIGEST_MINUTES
+    global SHARE_SEND_VIDEO, SHARE_VIDEO_MAX_MB, SHARE_VIDEO_QN
+    global VIDEO_LINK_ENABLED, VIDEO_LINK_MAX_MB, VIDEO_LINK_QN, VIDEO_LINK_COOLDOWN, VIDEO_SKIP_SEARCH_FALLBACK, VIDEO_DELETE_AFTER_SEND
     global STALE_AFTER, SYSTEM_SENDER_NAMES, BASE_SYSTEM_SENDERS, MASTER_WXID
     global VOICE_ENABLED, VOICE_BASE_URL, VOICE_MODEL, VOICE_API_KEY, VOICE_TIMEOUT, VOICE_MAX_SECONDS
     target = path or CONFIG_PATH
@@ -228,6 +344,25 @@ def reload_config(path=None):
     KEYBOARD_FALLBACK = bool(w.get("keyboardFallback", True))
     BACKGROUND_SEND = bool(w.get("backgroundSend", True))
     STICKER_TEST_ON = _as_bool(((cfg.get("features") or {}).get("stickers", False)), False)
+    _sb = w.get("stickerBusy") or {}
+    try:
+        STICKER_BUSY_CHANCE = max(0.0, min(1.0, float(_sb.get("chance", STICKER_BUSY_CHANCE))))
+    except Exception:  # noqa: BLE001
+        pass
+    STICKER_BUSY_TEXT = str(_sb.get("text") or STICKER_BUSY_TEXT).strip() or STICKER_BUSY_TEXT
+    _ia = w.get("imageAsk") or {}
+    IMAGE_ASK_ENABLED = _as_bool(_ia.get("enabled", IMAGE_ASK_ENABLED), IMAGE_ASK_ENABLED)
+    DOC_NO_SEARCH = _as_bool(_ia.get('docNoSearch', DOC_NO_SEARCH), DOC_NO_SEARCH)
+    try:
+        IMAGE_ASK_TTL = max(30.0, float(_ia.get("ttlSec", IMAGE_ASK_TTL)))
+        IMAGE_CALL_TTL = max(30.0, float(_ia.get("callTtlSec", IMAGE_CALL_TTL)))
+    except Exception:  # noqa: BLE001
+        pass
+    IMAGE_ASK_PRIVATE = str(_ia.get("privateText") or IMAGE_ASK_PRIVATE).strip() or IMAGE_ASK_PRIVATE
+    IMAGE_ASK_GROUP = str(_ia.get("groupText") or IMAGE_ASK_GROUP).strip() or IMAGE_ASK_GROUP
+    AT_UI_MODE = _as_bool(_ia.get("atUi", AT_UI_MODE), AT_UI_MODE)
+    _gn = _ia.get("groupNicknames")
+    GROUP_NICK_MAP = {str(k): str(v) for k, v in _gn.items()} if isinstance(_gn, dict) else {}
     ACCOUNT_GUARD = bool(w.get("accountGuard", True))
     try:
         WINDOW_HWND = int(w.get("windowHwnd") or 0)
@@ -256,6 +391,31 @@ def reload_config(path=None):
         SHARE_EVERY = float(sh.get("everyMinutes", 120))
     except Exception:
         SHARE_EVERY = 120.0
+    SHARE_SEND_VIDEO = _as_bool(sh.get("sendVideo", SHARE_SEND_VIDEO), SHARE_SEND_VIDEO)
+    try:
+        SHARE_VIDEO_MAX_MB = float(sh.get("videoMaxMB", SHARE_VIDEO_MAX_MB))
+    except Exception:
+        SHARE_VIDEO_MAX_MB = 50.0
+    try:
+        SHARE_VIDEO_QN = int(sh.get("quality", SHARE_VIDEO_QN))
+    except Exception:
+        SHARE_VIDEO_QN = 64
+    vl = cfg.get("wechat", {}).get("videoLink") or {}
+    VIDEO_LINK_ENABLED = _as_bool(vl.get("enabled", VIDEO_LINK_ENABLED), VIDEO_LINK_ENABLED)
+    try:
+        VIDEO_LINK_MAX_MB = float(vl.get("maxMB", VIDEO_LINK_MAX_MB))
+    except Exception:
+        VIDEO_LINK_MAX_MB = 100.0
+    try:
+        VIDEO_LINK_QN = int(vl.get("quality", VIDEO_LINK_QN))
+    except Exception:
+        VIDEO_LINK_QN = 64
+    try:
+        VIDEO_LINK_COOLDOWN = max(30.0, float(vl.get("cooldownSec", VIDEO_LINK_COOLDOWN)))
+    except Exception:
+        VIDEO_LINK_COOLDOWN = 300.0
+    VIDEO_SKIP_SEARCH_FALLBACK = _as_bool(vl.get("noSearchFallback", VIDEO_SKIP_SEARCH_FALLBACK), VIDEO_SKIP_SEARCH_FALLBACK)
+    VIDEO_DELETE_AFTER_SEND = _as_bool(vl.get("deleteAfterSend", VIDEO_DELETE_AFTER_SEND), VIDEO_DELETE_AFTER_SEND)
 
     ca = cfg.get("care") or {}
     global CARE_ENABLED, CARE_ALLOW_GROUPS, CARE_ONLY_MASTER, CARE_ALLOW_OTHERS
@@ -718,6 +878,133 @@ def log(*args):
 _win_problem_ts = {}
 
 
+# ---------------------------------------------------------------- 主动分享：视频文件
+_SHARE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+SHARE_CACHE_DIR = os.path.join(ROOT, "data", "share-cache")
+
+
+def _bili_bvid(link):
+    """从 B 站链接里抠出 BV 号（也兼容 av 号）。"""
+    m = re.search(r"(BV[0-9A-Za-z]{10})", str(link or ""))
+    if m:
+        return m.group(1)
+    m = re.search(r"/av(\d+)", str(link or ""), re.I)
+    return ("av" + m.group(1)) if m else ""
+
+
+def _bili_json(url, timeout=15):
+    r = LOCAL_HTTP.get(url, headers={"User-Agent": _SHARE_UA,
+                                     "Referer": "https://www.bilibili.com/"}, timeout=timeout)
+    return r.json()
+
+
+def _bili_direct_video(link, qn=64, timeout=20):
+    """取 B 站视频的直链（mp4）+ 大小 + 标题；拿不到返回 None。"""
+    bvid = _bili_bvid(link)
+    if not bvid:
+        return None
+    key = "bvid=" if bvid.startswith("BV") else "aid="
+    val = bvid if bvid.startswith("BV") else bvid[2:]
+    try:
+        view = _bili_json("https://api.bilibili.com/x/web-interface/view?%s%s" % (key, val), timeout)
+    except Exception as e:
+        log("取视频信息失败：", repr(e))
+        return None
+    if view.get("code") != 0:
+        log("取视频信息失败：", view.get("message"))
+        return None
+    data = view.get("data") or {}
+    cid = data.get("cid")
+    if not cid:
+        return None
+    try:
+        play = _bili_json("https://api.bilibili.com/x/player/playurl?%s%s&cid=%s&qn=%d&fnval=1&fourk=0"
+                          % (key, val, cid, int(qn)), timeout)
+    except Exception as e:
+        log("取视频直链失败：", repr(e))
+        return None
+    if play.get("code") != 0:
+        log("取视频直链失败：", play.get("message"))
+        return None
+    d = play.get("data") or {}
+    durl = d.get("durl") or []
+    if not durl:
+        log("这个视频拿不到直链（可能要大会员/付费）")
+        return None
+    return {"url": durl[0].get("url"),
+            "size": int(durl[0].get("size") or 0),
+            "title": str(data.get("title") or ""),
+            "duration": int(data.get("duration") or 0),
+            "quality": d.get("quality")}
+
+
+def _download_video(url, dest, max_bytes, timeout=60):
+    """流式下载视频到 dest；超过 max_bytes 立刻放弃并返回 0。"""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    got = 0
+    try:
+        r = LOCAL_HTTP.get(url, headers={"User-Agent": _SHARE_UA,
+                                         "Referer": "https://www.bilibili.com/"},
+                           stream=True, timeout=timeout)
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=262144):
+                if not chunk:
+                    continue
+                got += len(chunk)
+                if max_bytes and got > max_bytes:
+                    f.close()
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    log("视频超过上限（已下 %.1fMB），放弃" % (got / 1048576.0))
+                    return 0
+                f.write(chunk)
+        os.replace(tmp, dest)
+        return got
+    except Exception as e:
+        log("下载视频失败：", repr(e))
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return 0
+
+
+def _prune_share_cache(keep=6, max_mb=800):
+    """分享缓存只留最近几个文件，别把盘吃满。"""
+    try:
+        files = [os.path.join(SHARE_CACHE_DIR, n) for n in os.listdir(SHARE_CACHE_DIR)]
+    except Exception:
+        return
+    files = [p for p in files if os.path.isfile(p) and os.path.getsize(p) > 0]
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    for p in files[keep:]:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+    total = 0
+    for p in files[:keep]:
+        try:
+            total += os.path.getsize(p)
+        except Exception:
+            pass
+    limit = max_mb * 1048576
+    for p in files[:keep]:
+        if total <= limit:
+            break
+        try:
+            sz = os.path.getsize(p)
+            os.remove(p)
+            total -= sz
+        except Exception:
+            pass
+
+
 def log_window_problem(where, err):
     """窗口操作失败两分钟内只报一次。
 
@@ -1095,6 +1382,118 @@ def main():
         name = name or username
         name_cache[username] = name
         return name
+
+    # ---- 群昵称（chat_room.ext_buffer 里存着成员的群内显示名）----
+    _group_nick_cache = {}
+    _GROUP_NICK_TTL = 60.0
+
+    def _pb_varint(buf, i):
+        val = 0
+        shift = 0
+        while i < len(buf) and shift <= 63:
+            b = buf[i]
+            i += 1
+            val |= (b & 0x7f) << shift
+            if not (b & 0x80):
+                return val, i
+            shift += 7
+        return 0, i
+
+    def _pb_fields(buf):
+        i = 0
+        n = len(buf)
+        while i < n:
+            key, i = _pb_varint(buf, i)
+            fno = key >> 3
+            wt = key & 7
+            if wt == 0:
+                v, i = _pb_varint(buf, i)
+                yield fno, v
+            elif wt == 1:
+                yield fno, buf[i:i + 8]
+                i += 8
+            elif wt == 2:
+                ln, i = _pb_varint(buf, i)
+                yield fno, buf[i:i + ln]
+                i += ln
+            elif wt == 5:
+                yield fno, buf[i:i + 4]
+                i += 4
+            else:
+                return
+
+    def group_nick_map(chat_username):
+        """群内显示名：wxid -> 群昵称（读 chat_room.ext_buffer，60 秒缓存，改名会自动跟上）。"""
+        now = time.time()
+        hit = _group_nick_cache.get(chat_username)
+        if hit and (now - hit[0]) < _GROUP_NICK_TTL:
+            return hit[1]
+        out = {}
+        try:
+            conn = db._contact_conn()
+            if conn:
+                try:
+                    row = conn.execute(
+                        "SELECT ext_buffer FROM chat_room WHERE username=?",
+                        (chat_username,),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                raw = row[0] if row else None
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8", "ignore")
+                for fno, val in _pb_fields(bytes(raw or b"")):
+                    if fno != 1 or not isinstance(val, (bytes, bytearray)):
+                        continue
+                    who = ""
+                    disp = ""
+                    for f2, v2 in _pb_fields(bytes(val)):
+                        if f2 == 1 and isinstance(v2, (bytes, bytearray)):
+                            who = bytes(v2).decode("utf-8", "ignore")
+                        elif f2 == 2 and isinstance(v2, (bytes, bytearray)):
+                            disp = bytes(v2).decode("utf-8", "ignore").strip()
+                    if who and disp:
+                        out[who] = disp
+        except Exception as e:  # noqa: BLE001
+            log_throttled("group-nick-read", "读群昵称失败：", repr(e))
+        _group_nick_cache[chat_username] = (now, out)
+        return out
+
+    _at_name_cache = {}
+
+    def at_display_name(chat_username, member_username):
+        """群里 @ 用的显示名：config 指定 > 群成员备注/昵称 > 联系人备注/昵称。"""
+        _key = str(member_username or "")
+        if _key and _key in _at_name_cache:
+            return _at_name_cache[_key]
+        try:
+            m = (GROUP_NICK_MAP or {}).get(_key)
+        except Exception:  # noqa: BLE001
+            m = None
+        if m:
+            _at_name_cache[_key] = str(m)
+            return str(m)
+        try:
+            _gnm = group_nick_map(chat_username).get(_key) if chat_username else None
+        except Exception:  # noqa: BLE001
+            _gnm = None
+        if _gnm:
+            _at_name_cache[_key] = str(_gnm)
+            return str(_gnm)
+        try:
+            if chat_username and member_username:
+                for g in (db.get_group_members(chat_username) or []):
+                    if (g.get("username") or "") == member_username:
+                        nm = str(g.get("remark") or g.get("nick_name") or "").strip()
+                        if nm:
+                            _at_name_cache[_key] = nm
+                            return nm
+        except Exception:  # noqa: BLE001
+            pass
+        _nm = display_name(member_username)
+        if _key:
+            _at_name_cache[_key] = _nm
+        return _nm
 
     alias_cache = {}
     # 上次把这个会话切到哪一行名字（微信里没命名的群，行名是成员名）
@@ -1699,8 +2098,7 @@ def main():
                 return force_send_foreground(fn)
             return force_send_foreground(fn)
         finally:
-            if BACKGROUND_SEND:
-                restore_win_state(snap)
+            restore_win_state(snap) if BACKGROUND_SEND else None
             SEND_STATE["active"] = False
 
     def force_foreground(hwnd):
@@ -2612,7 +3010,26 @@ def main():
                 log("@ 成员异常：", repr(e))
         return False
 
-    def describe_image(msg):
+    _DOC_INTENT_RE = re.compile(
+        r"(总结|归纳|概括|整理|梳理|提炼|提取|摘录|转写|逐字|翻译|要点|列一下|列出来|清单|待办|日程|"
+        r"复盘|纪要|看看(?:写|说)了?什么|说的啥|讲了啥|写了?什么|内容是什么|什么意思|解读|"
+        r"分析一下|读一下|念一下|讲一下|有没有问题|检查一下|帮我看一下|帮我读一下|看看有没有|错别字|校对|润色)"
+    )
+    _IDENT_INTENT_RE = re.compile(
+        r"(谁|哪部|哪个作品|哪个动漫|哪个动画|哪个游戏|角色|人物|出处|来自|什么动画|什么动漫|"
+        r"什么游戏|画师|本子|表情包)"
+    )
+
+    def doc_task_request(text):
+        """这句要求是不是「读图上的文字并处理」而不是「认图里是什么」。"""
+        t = str(text or "")
+        if not t:
+            return False
+        if _IDENT_INTENT_RE.search(t):
+            return False
+        return bool(_DOC_INTENT_RE.search(t))
+
+    def describe_image(msg, doc_mode=False):
         try:
             import base64
             user = msg.get("username") or ""
@@ -2622,17 +3039,27 @@ def main():
                 return ""
             # 先用完整图（原图 > 压缩版），别拿缩略图去识别；两档都没有才退回 best
             path = None
-            for _tier in ("full", "best"):
-                try:
-                    path = _get_media().download_image(user, int(lid), tier=_tier, shard=shard)
-                except Exception as _e:
-                    log("图片下载失败（tier=%s）：%r" % (_tier, _e))
-                    path = None
-                if path:
-                    log("图片档位：%s → %d KB" % (_tier, os.path.getsize(path) // 1024))
+            # 微信收到图片后，.dat 往往比消息行晚 1~10 秒才落盘；立刻取会「取不到本地文件」。
+            # 等一小会儿重试即可（用户实测：发完图 2 秒内桥接就去读，必然扑空）。
+            _deadline = time.time() + 12.0
+            _attempt = 0
+            while True:
+                for _tier in ("full", "best"):
+                    try:
+                        path = _get_media().download_image(user, int(lid), tier=_tier, shard=shard)
+                    except Exception as _e:
+                        log("图片下载失败（tier=%s）：%r" % (_tier, _e))
+                        path = None
+                    if path:
+                        log("图片档位：%s → %d KB（第 %d 次取图）"
+                            % (_tier, os.path.getsize(path) // 1024, _attempt + 1))
+                        break
+                if path or time.time() >= _deadline:
                     break
+                _attempt += 1
+                time.sleep(0.8)
             if not path:
-                log("图片取不到本地文件")
+                log("图片取不到本地文件（等了 12 秒还没落盘：图可能没下载/已过期/目录被改）")
                 return ""
             with open(path, "rb") as f:
                 raw = f.read()
@@ -2649,10 +3076,28 @@ def main():
                     conv = None
                     log("wxgf 转码异常：", repr(_e))
                 if not conv:
-                    log("这张图是 wxgf/HEVC，本机 ffmpeg 没能转出来，跳过（装 ffmpeg 到 C:\\ffmpeg 即可）")
-                    return ""
-                raw = conv
-                ext = ".jpg"
+                    # wxgf（HEVC）转不出来时不要直接放弃：缩略图 _t.dat 往往是标准 JPEG，够识别了
+                    log("这张图是 wxgf/HEVC，本机 ffmpeg 没能转出来，改用缩略图（装 ffmpeg 到 C:\\ffmpeg 可恢复原图识别）")
+                    alt = None
+                    try:
+                        alt = _get_media().download_image(user, int(lid), tier="thumb", shard=shard)
+                    except Exception as _e:
+                        log("缩略图重试失败：", repr(_e))
+                    if alt:
+                        with open(alt, "rb") as f:
+                            raw_alt = f.read()
+                        if raw_alt[:3] == b"\xff\xd8\xff" or raw_alt[:4] == b"\x89PNG" or raw_alt[:3] == b"GIF":
+                            raw = raw_alt
+                            path = alt
+                            ext = os.path.splitext(alt)[1].lower()
+                            if ext not in (".jpg", ".jpeg", ".png", ".gif"):
+                                ext = ".jpg"
+                    if not (raw[:3] == b"\xff\xd8\xff" or raw[:4] == b"\x89PNG" or raw[:3] == b"GIF"):
+                        log("这张图确实认不出来，跳过")
+                        return ""
+                else:
+                    raw = conv
+                    ext = ".jpg"
             elif raw[:8] == b"\x89PNG\r\n\x1a\n":
                 ext = ".png"
             elif raw[:3] == b"\xff\xd8\xff":
@@ -2662,8 +3107,27 @@ def main():
             else:
                 ext = os.path.splitext(path)[1].lower()
                 if ext not in (".jpg", ".jpeg", ".png", ".gif"):
-                    log("图片格式不认识（%s），跳过" % raw[:4])
-                    return ""
+                    # 解出来的字节既不是 jpg/png/gif、也不是 wxgf 容器：
+                    # 常见于「取图那一刻图片密钥还没拿对」，解出一坨乱码并落成 .img。
+                    # 这时不要直接放弃，退回缩略图（_t.dat，通常早就是标准 JPEG）再试一次。
+                    log("图片格式不认识（%s），改用缩略图重试" % raw[:4])
+                    alt = None
+                    try:
+                        alt = _get_media().download_image(user, int(lid), tier="thumb", shard=shard)
+                    except Exception as _e:
+                        log("缩略图重试失败：", repr(_e))
+                    if alt:
+                        with open(alt, "rb") as f:
+                            raw_alt = f.read()
+                        if raw_alt[:3] == b"\xff\xd8\xff" or raw_alt[:4] == b"\x89PNG" or raw_alt[:3] == b"GIF":
+                            raw = raw_alt
+                            path = alt
+                            ext = os.path.splitext(alt)[1].lower()
+                            if ext not in (".jpg", ".jpeg", ".png", ".gif"):
+                                ext = ".jpg"
+                    if not (raw[:3] == b"\xff\xd8\xff" or raw[:4] == b"\x89PNG" or raw[:3] == b"GIF"):
+                        log("缩略图也不是标准图片，跳过这张（%s）" % raw[:4])
+                        return ""
             mime = "image/png" if ext == ".png" else ("image/gif" if ext == ".gif" else "image/jpeg")
             base = bot_url.rsplit("/webhook", 1)[0]
 
@@ -2701,7 +3165,11 @@ def main():
             texts = []
             for idx, part in enumerate(parts):
                 prompt = ""
-                if len(parts) > 1:
+                if doc_mode:
+                    prompt = DOC_IMAGE_PROMPT
+                    if len(parts) > 1:
+                        prompt += "（这是第 %d/%d 段，只转写这一段里的文字）" % (idx + 1, len(parts))
+                elif len(parts) > 1:
                     prompt = "这是一张长截图从上往下的第 %d/%d 段。逐条转写这一段里的文字（分清左边对方/右边本人），不要省略。" % (idx + 1, len(parts))
                 r = LOCAL_HTTP.post(
                     base + "/api/vision",
@@ -2715,8 +3183,9 @@ def main():
                 if not data.get("ok", True):
                     log_throttled("img-fail:" + str(data.get("error"))[:40], "第 %d 段识别失败：%s" % (idx + 1, data.get("error")))
             text = "\n".join(texts).strip()
+            _cap = 3500 if doc_mode else 1200
             if len(text) > 1200:
-                text = text[:1200] + "…"
+                text = text[:_cap] + "…"
             log("图片识别：", text[:80])
             return text
         except Exception as e:
@@ -2772,6 +3241,110 @@ def main():
             return ""
 
 
+    def sticker_busy_reply(username):
+        """收到表情包：按概率假装「服务器繁忙，请稍后重试」。
+
+        彩蛋性质 —— 微信自己偶尔也弹这句，让她学着回一句，比一声不吭更像活人。
+        概率/文案看 config.json 的 wechat.stickerBusy（chance=0 关掉），
+        同一个会话 5 分钟内最多一次。返回是否真的发出去了。
+        """
+        try:
+            chance = float(STICKER_BUSY_CHANCE)
+        except Exception:  # noqa: BLE001
+            chance = 0.0
+        if chance <= 0 or not username or username in dead_chats:
+            return False
+        now = time.time()
+        try:
+            last = float(_sticker_busy_at.get(username, 0) or 0)
+        except Exception:  # noqa: BLE001
+            last = 0.0
+        if now - last < STICKER_BUSY_COOLDOWN:
+            return False
+        try:
+            hit = random.random() < chance
+        except Exception:  # noqa: BLE001
+            hit = False
+        if not hit:
+            return False
+        _sticker_busy_at[username] = now
+        try:
+            name = display_name(username) or ""
+        except Exception:  # noqa: BLE001
+            name = ""
+        log("表情包 → 假装服务器繁忙：%s" % (STICKER_BUSY_TEXT,))
+        try:
+            send_text(STICKER_BUSY_TEXT, name, username)
+        except Exception as e:  # noqa: BLE001
+            log("假装服务器繁忙没发出去：", repr(e))
+            return False
+        return True
+
+    # ---- 活人感 / 群聊批处理 的配置（config.json → wechat.batch / wechat.liveness） ----
+    _HUMAN = {"at": 0.0, "batch": True, "window": 2.5, "max": 5, "typing": True, "perChar": 0.03, "typingMax": 1.5}
+
+    def _human_cfg():
+        try:
+            now_ts = time.time()
+        except Exception:
+            return _HUMAN
+        if now_ts - float(_HUMAN.get("at") or 0) < 60.0:
+            return _HUMAN
+        cfg = dict(_HUMAN)
+        cfg["at"] = now_ts
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+                _root = json.load(_f)
+            _w = (_root.get("wechat") or {})
+            _b = (_w.get("batch") or {})
+            _l = (_w.get("liveness") or {})
+            cfg["batch"] = bool(_b.get("enabled", True))
+            cfg["window"] = max(0.5, min(10.0, float(_b.get("windowSec", 2.5) or 2.5)))
+            cfg["max"] = max(2, min(20, int(_b.get("maxMessages", 5) or 5)))
+            cfg["typing"] = bool(_l.get("typing", True))
+            cfg["perChar"] = max(0.0, min(0.2, float(_l.get("perCharSec", 0.03) or 0.0)))
+            cfg["typingMax"] = max(0.0, min(5.0, float(_l.get("typingMaxSec", 1.5) or 0.0)))
+        except Exception:
+            pass
+        _HUMAN.update(cfg)
+        return _HUMAN
+
+    # ---- 发送失败降级链：主通道失败 → 键盘通道 → 隔 0.6 秒强制重发 ----
+    _plain_send_text = send_text
+
+    def send_text(text, chat_display_name, chat_username="", force=False, quote_text=None):
+        _tx = str(text if text is not None else "")
+        try:
+            _hc = _human_cfg()
+            if _hc.get("typing"):
+                _pause = min(float(_hc.get("typingMax") or 0.0), float(_hc.get("perChar") or 0.0) * len(_tx))
+                if _pause > 0.25:
+                    time.sleep(_pause)
+        except Exception:
+            pass
+        _ok = False
+        try:
+            _ok = _plain_send_text(text, chat_display_name, chat_username, force=force, quote_text=quote_text)
+        except Exception as e:  # noqa: BLE001
+            log("发送失败（主通道）：", repr(e))
+        if _ok:
+            return True
+        log("发送失败，降级到键盘通道：", _tx[:24])
+        try:
+            if keyboard_send(_tx, chat_display_name, chat_username):
+                log("键盘通道发送成功")
+                return True
+        except Exception as e:  # noqa: BLE001
+            log("键盘通道也失败：", repr(e))
+        try:
+            time.sleep(0.6)
+            if _plain_send_text(text, chat_display_name, chat_username, force=True, quote_text=quote_text):
+                log("降级重试发送成功")
+                return True
+        except Exception as e:  # noqa: BLE001
+            log("重试发送仍失败：", repr(e))
+        return False
+
     def on_message_inner(msg, listener):
         try:
             username = msg.get("username") or ""
@@ -2782,9 +3355,41 @@ def main():
             # 有的微信版本把表情包报成「图片」，正文里还是 <emoji md5=...>：
             # 一律按表情包装死，绝不能送进视觉模型当图片认。
             if "<emoji" in content:
-                log("收到表情包（被标成图片），装死（不识别不回）")
+                log("收到表情包（被标成图片），不送视觉模型")
+                sticker_busy_reply(username)
                 return
             if mtype == "图片":
+                if IMAGE_ASK_ENABLED:
+                    # 先不识别：把图片挂起，先问一句「想让我拿这张图做什么」，
+                    # 等对方下一句（比如「这是谁」「帮我翻译」「这图什么梗」）再一起处理。
+                    _p_sender = msg.get("sender_username") or ""
+                    _p_group = username.endswith("@chatroom")
+                    _p_nick = ""
+                    try:
+                        _p_nick = at_display_name(username, _p_sender) or ""
+                    except Exception:  # noqa: BLE001
+                        _p_nick = ""
+                    if not _p_nick:
+                        _p_nick = "群友" if _p_group else "微信好友"
+                    PENDING_IMAGE[username] = {
+                        "msg": msg,
+                        "sender": _p_sender,
+                        "nick": _p_nick,
+                        "at": time.time(),
+                        # 群聊：先安静挂着，等发图人喊外号/@ 她再问用途；私聊：直接问
+                        "stage": "waiting" if _p_group else "asked",
+                    }
+                    if _p_group:
+                        # 群里先不出声：等发图人喊她的外号（鲸鲸/肥鱼…）或 @ 她，再问用途
+                        log("收到群图片 → 先挂起（等发图人叫外号/@，%.0fs 内有效）" % IMAGE_CALL_TTL)
+                        return
+                    _ask = IMAGE_ASK_PRIVATE
+                    try:
+                        send_text(_ask, display_name(username), username)
+                    except Exception as e:  # noqa: BLE001
+                        log("询问图片用途没发出去：", repr(e))
+                    log("收到私聊图片 → 先问用途（等下一句，%.0fs 内有效）" % IMAGE_ASK_TTL)
+                    return
                 desc = describe_image(msg)
                 if not desc:
                     return
@@ -2796,9 +3401,10 @@ def main():
                     return
                 content = "（对方发了一条语音，说的是：%s）" % said
             if mtype in ("表情", "动画表情"):
-                # 表情包发了装死：不去识别、不回话。以前会把表情包当图片认（截图/转码/
-                # 送视觉模型），认出来还硬回一句，容易接岔；现在明确要的是「发了就装死」。
-                log("收到表情包，装死（不识别不回）")
+                # 表情包不送视觉模型；按 wechat.stickerBusy 的概率回一句「假装服务器繁忙」，
+                # 其余时候照旧一声不吭（默认 30%）。
+                log("收到表情包，不送视觉模型")
+                sticker_busy_reply(username)
                 return
             if mtype not in ("文本", "语音", "图片", "表情", "动画表情"):
                 if "移出群聊" in content or "移出" in content:
@@ -2825,21 +3431,111 @@ def main():
                 content = (msg.get("content") or "").strip()
             if not content or content.startswith("<"):
                 return
+            if (msg.get("sender_username") or "") == me:
+                return  # 自己发的（包括刚发的询问）：不参与图片合并，也不消费 PENDING_IMAGE
+            _pending_merged = False
+            if mtype == "文本" and IMAGE_ASK_ENABLED:
+                _pend = PENDING_IMAGE.get(username)
+                if _pend:
+                    _stage = _pend.get("stage") or "asked"
+                    _ttl = IMAGE_CALL_TTL if _stage == "waiting" else IMAGE_ASK_TTL
+                    if (time.time() - float(_pend.get("at") or 0)) > _ttl:
+                        PENDING_IMAGE.pop(username, None)
+                        log("图片等待超时，丢弃：", display_name(username))
+                    elif _stage == "waiting":
+                        # 群聊挂起中：发图人喊到她的外号（或 @ 她）才继续
+                        import re as _call_re
+                        _from_sender = (msg.get("sender_username") or "") == (_pend.get("sender") or "")
+                        _hit = ""
+                        if _from_sender:
+                            for _a in aliases:
+                                if not _a:
+                                    continue
+                                try:
+                                    if _call_re.search(r"@\s*" + _call_re.escape(str(_a)), content) or str(_a) in content:
+                                        _hit = str(_a)
+                                        break
+                                except Exception:  # noqa: BLE001
+                                    continue
+                        if not _hit:
+                            if (msg.get("sender_username") or "") != (_pend.get("sender") or ""):
+                                log("群里别人说话，挂起的图片继续等发图人：", content[:18])
+                        else:
+                            _left = content
+                            # 群消息正文常带「wxid_xxx:」或「昵称:」前缀，先剥掉，别把它当成要求
+                            _left = _left.strip()
+                            _left = _call_re.sub(r"^[A-Za-z0-9_\-]{4,}:\s*", "", _left)
+                            _left = _call_re.sub(r"^[^\n:]{1,24}:\s*", "", _left)
+                            _left = _call_re.sub(r"wxid_[A-Za-z0-9_\-]+", " ", _left)
+                            for _a in aliases:
+                                if _a:
+                                    _left = _call_re.sub(_call_re.escape(str(_a)), " ", _left)
+                            _left = _call_re.sub(r"@", " ", _left)
+                            _left = _call_re.sub(r"\s+", "", _left).strip("，,。.!！?？…~～、@")
+                            import re as _pure_re
+                            _pure_call = bool(_pure_re.match(r"^(在吗|在不在|你在吗|在么|咋了|怎么了|干嘛|干什么|什么事|啥事|有事|叫我了?)$", _left))
+                            if len(_left) >= 2 and not _pure_call:
+                                # 叫她的同时已经把用途说了 → 直接当用途用
+                                _pend["stage"] = "asked"
+                                _stage = "asked"
+                                log("叫「%s」时已带上要求，直接处理：%s" % (_hit, _left[:30]))
+                            else:
+                                _ask = IMAGE_ASK_GROUP if username.endswith("@chatroom") else IMAGE_ASK_PRIVATE
+                                try:
+                                    if AT_UI_MODE:
+                                        send_at(_pend.get("nick") or "群友", _ask, display_name(username), username)
+                                    elif username.endswith("@chatroom"):
+                                        send_text("@" + (_pend.get("nick") or "群友") + " " + _ask, display_name(username), username)
+                                    else:
+                                        send_text(_ask, display_name(username), username)
+                                except Exception as e:  # noqa: BLE001
+                                    log("询问图片用途没发出去：", repr(e))
+                                _pend["stage"] = "asked"
+                                _pend["at"] = time.time()
+                                log("等到了「%s」，已问用途（%.0fs 内有效）" % (_hit, IMAGE_ASK_TTL))
+                                return
+                    if _pend and _stage == "asked" and (time.time() - float(_pend.get("at") or 0)) <= IMAGE_ASK_TTL:
+                        _doc = bool(DOC_NO_SEARCH) and doc_task_request(content)
+                        if _doc:
+                            log("识别为文档/截图类要求，只读图不联网：", content[:40])
+                        _desc = describe_image(_pend.get("msg") or msg, doc_mode=_doc)
+                        PENDING_IMAGE.pop(username, None)
+                        if _desc:
+                            content = ("（对方先发了一张图片，图里是：%s）\n"
+                                       "对方接着说：%s" % (_desc, content))
+                            _pending_merged = True
+                            log("图片 + 下一句 合并处理：", content[:40])
+                            log("[debug] 合并后长度=%d 开头=%s" % (len(content), content[:24]))
+                        else:
+                            log("挂起的图片没识别出来，按纯文字处理")
             sender = msg.get("sender_username") or ""
             if sender == me:
+                log("[debug] 跳过：sender == me", content[:20])
                 return  # 自己发的
             create_time = float(msg.get("create_time") or 0)
             if create_time and create_time < START_TS - SKIP_OLDER_THAN:
                 return
+                log("[debug] 跳过：早于桥接启动", content[:20])
             # 已经放了太久的消息（比如前面堵着几条），不再回
             if create_time and (time.time() - create_time) > STALE_AFTER:
                 log("跳过过期消息（%.0fs 前）：%s" % (time.time() - create_time, content[:20]))
                 return
 
+            # 别人发来 B 站视频链接：后台下完整视频再发回去（群/私聊都管）
+            if VIDEO_LINK_ENABLED and content and ("bilibili.com" in content or "b23.tv" in content):
+                try:
+                    _vlinks = video_link_bvids(content)
+                    if _vlinks:
+                        threading.Thread(target=_video_link_worker,
+                                         args=(username, display_name(username), _vlinks),
+                                         daemon=True).start()
+                except Exception as _vle:  # noqa: BLE001
+                    log("识别视频链接失败：", repr(_vle))
+
             is_group = username.endswith("@chatroom")
             nickname = ""
             try:
-                nickname = db.get_nickname(sender) or ""
+                nickname = (at_display_name(username, sender) if is_group else (db.get_nickname(sender) or ""))
             except Exception:
                 nickname = ""
             if not nickname:
@@ -2872,6 +3568,9 @@ def main():
                 )
                 for a in aliases
             )
+            if _pending_merged:
+                # 这张图是我们先问的，群里就算没 @ 也把下一句当成在跟她说话
+                addressed = True
             _at_remainder = _mention_re.sub(r"^[A-Za-z0-9_\-]{4,}:\s*", "", _at_text).strip()
             for _alias in aliases:
                 if _alias:
@@ -2902,6 +3601,7 @@ def main():
                     if _name and _name not in aliases and _name not in _mentioned_names:
                         _mentioned_names.append(_name)
             log("收到", ("群" if is_group else "私聊"), display_name(username), "←", nickname, "：", content[:30])
+            log("[debug] 准备提交 mtype=%s merged=%s 长度=%d" % (mtype, str(_pending_merged), len(content)))
             payload = {
                 "chat_id": username,
                 "chat_type": "group" if is_group else "private",
@@ -2977,7 +3677,7 @@ def main():
                         if body.startswith(prefix):
                             body = body[len(prefix):].lstrip(" ，,：:")
                             break
-                    if send_at(mention, body, target, username):
+                    if AT_UI_MODE and send_at(mention, body, target, username):
                         first = False
                         time.sleep(0.6)
                         continue
@@ -3020,10 +3720,87 @@ def main():
     threading.Thread(target=sticker_test_loop, daemon=True).start()
 
 
-    def on_message(msg, listener):
-        # 每条消息丢线程池：发送慢不再阻塞后面消息的接收
+    # ---- 群聊批处理：窗口内几条消息合并成一条上下文再回 ----
+    _batch_pending = {}
+    _batch_lock = threading.Lock()
+
+    def _batch_flush(key):
+        with _batch_lock:
+            item = _batch_pending.pop(key, None)
+        if not item:
+            return
+        msgs = list(item.get("msgs") or [])
+        if len(msgs) <= 1:
+            if msgs:
+                try:
+                    executor.submit(on_message_inner, msgs[0], item.get("listener"))
+                except Exception as e:  # noqa: BLE001
+                    log("批处理提交失败：", repr(e))
+            return
+        last = dict(msgs[-1])
+        lines = []
+        for m in msgs:
+            nm = ""
+            try:
+                nm = at_display_name(key, m.get("sender_username") or "") or ""
+            except Exception:  # noqa: BLE001
+                nm = ""
+            lines.append("%s：%s" % (nm or "群友", (m.get("content") or "").strip()))
+        last["type"] = "文本"
+        last["content"] = "\n".join(lines)
+        log("群聊批处理：合并 %d 条一起回" % len(lines))
         try:
-            executor.submit(on_message_inner, msg, listener)
+            executor.submit(on_message_inner, last, item.get("listener"))
+        except Exception as e:  # noqa: BLE001
+            log("批处理提交失败：", repr(e))
+
+    def _dispatch(msg, listener):
+        try:
+            hc = _human_cfg()
+            username = msg.get("username") or ""
+            mtype = msg.get("type") or ""
+            content = (msg.get("content") or "").strip()
+            sender = msg.get("sender_username") or ""
+            if (not hc.get("batch")) or (not username.endswith("@chatroom")) or mtype != "文本" or not content:
+                executor.submit(on_message_inner, msg, listener)
+                return
+            if content.startswith("<") or content.startswith("/") or sender == me:
+                executor.submit(on_message_inner, msg, listener)
+                return
+            size = 0
+            with _batch_lock:
+                item = _batch_pending.get(username)
+                if item is None:
+                    item = {"msgs": [], "listener": listener, "timer": None}
+                    _batch_pending[username] = item
+                item["msgs"].append(msg)
+                size = len(item["msgs"])
+                if item.get("timer") is None:
+                    t = threading.Timer(float(hc.get("window") or 2.5), _batch_flush, args=(username,))
+                    t.daemon = True
+                    item["timer"] = t
+                    t.start()
+            if size >= int(hc.get("max") or 5):
+                with _batch_lock:
+                    it = _batch_pending.get(username)
+                    if it and it.get("timer") is not None:
+                        try:
+                            it["timer"].cancel()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        it["timer"] = None
+                _batch_flush(username)
+        except Exception as e:  # noqa: BLE001
+            log("批处理分发失败：", repr(e))
+            try:
+                executor.submit(on_message_inner, msg, listener)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def on_message(msg, listener):
+        # 每条消息丢线程池：发送慢不再阻塞后面消息的接收；群里开了批处理就先攒着
+        try:
+            _dispatch(msg, listener)
         except Exception as e:
             log("提交消息处理失败：", repr(e))
 
@@ -3060,6 +3837,117 @@ def main():
             time.sleep(0.3)
         if NOTIFIED:
             log("已通知最近的聊天：", "、".join(n for _, n in NOTIFIED))
+
+    def _video_skip_search(on):
+        """发视频期间临时禁掉 open_chat 的搜索框回退（避免下载完却退到搜索框）。"""
+        try:
+            mod = sys.modules.get("uia_compat")
+            if mod is not None:
+                setattr(mod, "SKIP_SEARCH_FALLBACK", bool(on))
+        except Exception:
+            pass
+
+
+    def send_video_file(path, chat_display_name, chat_username=""):
+        """把本地视频当视频消息发过去（走窗口自动化）；失败返回 False。"""
+        nonlocal gui
+        if chat_username and chat_username in dead_chats:
+            log("跳过已失效的会话：", chat_display_name)
+            return False
+        if chat_username and not group_is_alive(chat_username):
+            dead_chats.add(chat_username)
+            log("群里已经没有我了（被移出？），以后跳过：", chat_display_name)
+            return False
+        if not account_send_allowed("发送视频"):
+            return False
+        with send_lock:
+            with gui_lock:
+                if gui is None:
+                    log("初始化微信窗口驱动…（会抢一下焦点，约 5~10 秒）")
+                    gui = WeChatGUI()
+            bind_gui_window(gui)
+            _video_skip_search(VIDEO_SKIP_SEARCH_FALLBACK)
+            try:
+                ok = bool(with_window_on_top(
+                    lambda: gui.send_file(path, who=chat_display_name, verify=False)))
+            except Exception as e:
+                log("发送视频失败：", repr(e))
+                return False
+            finally:
+                _video_skip_search(False)
+            if not ok:
+                log("发送视频没成功（窗口没响应/找不到会话）")
+            return ok
+
+    def share_video_to(chat_username, chat_display, link, max_mb=None, qn=None):
+        """主动分享：下载完整视频再以视频消息发；任何一步失败都返回 False 让调用方退回发链接。"""
+        if chat_username and chat_username in dead_chats:
+            return False
+        info = _bili_direct_video(link, qn or SHARE_VIDEO_QN)
+        if not info or not info.get("url"):
+            return False
+        _limit_mb = SHARE_VIDEO_MAX_MB if max_mb is None else float(max_mb)
+        max_bytes = int(max(0.0, _limit_mb) * 1048576)
+        if max_bytes and info.get("size") and info["size"] > max_bytes:
+            log("视频太大（%.1fMB > %.0fMB），这次改发链接" % (info["size"] / 1048576.0, _limit_mb))
+            return False
+        if max_bytes and not info.get("size"):
+            log("拿不到视频大小，按上限 %.0fMB 边下边卡" % _limit_mb)
+        name = _bili_bvid(link) or ("share-%d" % int(time.time()))
+        dest = os.path.join(SHARE_CACHE_DIR, name + ".mp4")
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            log("视频命中缓存：", os.path.basename(dest))
+        else:
+            t0 = time.time()
+            got = _download_video(info["url"], dest, max_bytes)
+            if not got:
+                return False
+            log("视频已下载：%.1fMB / %.1fs" % (got / 1048576.0, time.time() - t0))
+        if not send_video_file(dest, chat_display, chat_username):
+            return False
+        try:
+            log("已发视频消息（%.1fMB，qn=%s）" % (os.path.getsize(dest) / 1048576.0, info.get("quality")))
+        except Exception:
+            pass
+        if VIDEO_DELETE_AFTER_SEND:
+            try:
+                os.remove(dest)
+                log("视频发完已删除本地文件（节省磁盘）：", os.path.basename(dest))
+            except Exception:
+                pass
+        _prune_share_cache()
+        return True
+
+    def send_video_link(chat_username, chat_display, link):
+        """收到别人发的视频链接：把完整视频下下来再当视频消息发回去。"""
+        if not VIDEO_LINK_ENABLED:
+            return False
+        link = _resolve_video_url(link)
+        bv = _bili_bvid(link)
+        if not bv:
+            return False
+        now = time.time()
+        with _video_link_lock:
+            last = _video_link_at.get(bv) or 0
+            if now - last < VIDEO_LINK_COOLDOWN:
+                log("这个视频刚发过（%d 秒内不重复发）：%s" % (int(VIDEO_LINK_COOLDOWN), bv))
+                return False
+            _video_link_at[bv] = now
+        log("收到视频链接 → 下载完整视频：", chat_display, bv)
+        ok = share_video_to(chat_username, chat_display, link,
+                            max_mb=VIDEO_LINK_MAX_MB, qn=VIDEO_LINK_QN)
+        if ok:
+            log("完整视频已发出：", chat_display, bv)
+        else:
+            log("这个链接没能发成视频（太大/拿不到直链/发送失败）：", bv)
+        return ok
+
+    def _video_link_worker(chat_username, chat_display, links):
+        for link, _bv in links:
+            try:
+                send_video_link(chat_username, chat_display, link)
+            except Exception as e:  # noqa: BLE001
+                log("处理视频链接失败：", repr(e))
 
     def share_watch():
         """每隔一段时间自己刷 B 站热门，挑一个没分享过的发到最近活跃的群/私聊。"""
@@ -3116,7 +4004,17 @@ def main():
                 ])
             text = "%s\n%s" % (link, comment)
             log("主动分享视频 →", name, str(video.get("title"))[:30])
-            send_text(text, name, u)
+            shared = False
+            if SHARE_SEND_VIDEO:
+                try:
+                    shared = share_video_to(u, name, link)
+                except Exception as e:
+                    log("发视频失败，退回发链接：", repr(e))
+            if shared:
+                if comment:
+                    send_text(comment, name, u)
+            else:
+                send_text(text, name, u)
 
     def care_watch():
         """主动搭话：没事的时候她自己来问一句「在干啥 / 累不累」。

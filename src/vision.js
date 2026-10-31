@@ -160,8 +160,8 @@ async function describe(config, { imageBase64, mime = 'image/jpeg', prompt = '' 
   if (!apiKey) {
     throw new Error(
       '看图没有 Key：网页右上角「设置」→ 填「看图 API Key」' +
-      '（默认智谱 GLM-4V-Flash，Key 在 open.bigmodel.cn 申请，免费额度够用；' +
-      'DeepSeek 的 Key 不能看图）'
+      '（默认智谱 GLM-4V-Flash；也可以用 DeepSeek 的 deepseek-flash（V4.1-Flash）看图，' +
+      '那样一个 DeepSeek Key 就够了）'
     );
   }
   // 以真实文件头为准；wxgf（微信 HEVC 容器）视觉接口不认，提前说清楚
@@ -187,22 +187,51 @@ async function describe(config, { imageBase64, mime = 'image/jpeg', prompt = '' 
     // 别的服务商可以给多一些；要改也可以写 config.json 的 vision.maxTokens
     max_tokens: Number(v.maxTokens) || (/bigmodel\.cn/i.test(baseUrl) ? 1024 : 1600),
   };
+  // DeepSeek 的 V4 系列能看图，但默认 effort=high 会把 token 先花在思考上，看图不需要长思考
+  if (/deepseek/i.test(baseUrl) || /deepseek/i.test(model)) {
+    // 看图转写属于机械活：deepseek-flash 的思考链纯浪费 token 和延迟（实测 8~12s → 3s），
+    // 按用户要求：看图识别也保留思考，只压到 low 一档（默认 high 太慢）。
+    const mode = String(v.thinking || 'low').toLowerCase();
+    if (mode === 'off' || mode === 'none' || mode === 'false') {
+      // 看图是机械活，思考链纯浪费延迟和 token（实测 8~12s → 3s，正文一样准）。
+      // 识图小调用（提炼特征/抽候选/核对）本来也全是关思考的，这里保持一致。
+      body.thinking = { type: 'disabled' };
+    } else {
+      body.reasoning_effort = 'low';
+    }
+    // 思考链会先吃 token：1024 会被吃光、正文为空，这里给足 4096
+    body.max_tokens = Math.max(4096, Number(body.max_tokens) || 0);
+  }
 
   const resp = await postJson(baseUrl + '/chat/completions', body, { Authorization: 'Bearer ' + apiKey }, Number(v.timeoutMs) || 30000);
   if (resp.status !== 200) {
     const msg = (resp.json && resp.json.error && (resp.json.error.message || resp.json.error.code)) || ('HTTP ' + resp.status);
-    // 401/403 基本都是 Key 不对。很多人把 DeepSeek 的 Key 填到这里——DeepSeek 没有看图接口
+    // 401/403 基本都是 Key 不对（或这个 Key 没开通看图权限）
     const hint = resp.status === 401 || resp.status === 403
-      ? '（Key 无效或没有看图权限：这里要 open.bigmodel.cn 的智谱 Key，DeepSeek 的 Key 不支持看图）'
+      ? '（Key 无效或没有看图权限：智谱要用 open.bigmodel.cn 的 Key，DeepSeek 要用自己的 Key）'
       : '';
     throw new Error('视觉模型返回：' + msg + hint);
   }
-  const text =
-    resp.json &&
-    resp.json.choices &&
-    resp.json.choices[0] &&
-    resp.json.choices[0].message &&
-    resp.json.choices[0].message.content;
+  const pickText = (json) => {
+    const ch = json && json.choices && json.choices[0];
+    const msg = ch && ch.message;
+    return {
+      text: String((msg && msg.content) || '').trim(),
+      finish: String((ch && ch.finish_reason) || ''),
+    };
+  };
+  let { text, finish } = pickText(resp.json);
+  // 正文为空且是被 max_tokens 截断（思考链吃满预算）→ 加大预算再要一次
+  if (!text && finish === 'length') {
+    const retry = Object.assign({}, body, { max_tokens: Math.max(6144, (Number(body.max_tokens) || 0) * 2) });
+    try {
+      const resp2 = await postJson(baseUrl + '/chat/completions', retry, { Authorization: 'Bearer ' + apiKey }, Number(v.timeoutMs) || 30000);
+      if (resp2.status === 200) ({ text } = pickText(resp2.json));
+    } catch (err) {
+      if (!text) throw err;
+    }
+  }
+  if (!text) throw new Error('看图模型这次只输出了思考过程、没有正文（可以再发一次，或把 config.json 里 vision.maxTokens 调大）');
   return String(text || '').trim();
 }
 

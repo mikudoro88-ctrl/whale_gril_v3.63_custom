@@ -48,15 +48,25 @@ for (const [label, customPrompt] of [['默认', ''], ['自定义', '你是鲸鲸
 
   test(`${label}提示词共享高优先级的多人指代和实质回答规则`, () => {
     const sys = build({ text: '@鲸鲸 小海说「你怎么还没吃饭」，是在问阿螈' });
-    if (customPrompt) assert.ok(sys.startsWith(customPrompt), '保留自定义人设原文');
-    assert.match(sys, /对话理解与回答质量（最高优先级）/);
-    assert.match(sys, /优先于自定义人设、语气、梗、示例和反击要求/);
+    if (customPrompt) {
+      // v5：自定义人设挪到最后并声明最高优先级，通用规则只保留「谁在对谁说话」
+      // 人设之后可能再跟一段「此刻情绪」（动态状态），允许这种尾巴
+    const afterPersona = sys.slice(sys.indexOf(customPrompt) + customPrompt.length);
+    // v6 起为了 Prefix-Cache，每轮会变的部分（当前场景/时间/语气/情绪）挪到人设之后
+    assert.ok(afterPersona.trim() === '' || /【当前】/.test(afterPersona) || /【此刻情绪/.test(afterPersona), '人设之后只应该有每轮会变的部分');
+    assert.ok(sys.includes(customPrompt), '保留自定义人设原文（放在最后才压得住通用规则）');
+      assert.match(sys, /【对话理解（只约束说话对象和指代，不管语气、长度、接梗）】/);
+      assert.match(sys, /【以下是你本人的人设与说话方式（最高优先级/);
+    } else {
+      assert.match(sys, /对话理解与回答质量（最高优先级）/);
+      assert.match(sys, /优先于自定义人设、语气、梗、示例和反击要求/);
+      assert.match(sys, /回答简短但有实质内容/);
+    }
     assert.match(sys, /群聊历史是多个人参与的消息事件/);
     assert.match(sys, /不是每个「你」都指机器人/);
     assert.match(sys, /@机器人只是请求你回应，不会把引用、转述或对其他人说的话中的「你」重新绑定/);
     assert.match(sys, /明确点名、@目标、引用对象和上下文中的明确指向优先/);
     assert.match(sys, /只有确实存在影响回答的歧义时才简短澄清/);
-    assert.match(sys, /回答简短但有实质内容/);
     assert.match(sys, /不硬塞鲸鱼、海洋、吃的等主题/);
     assert.match(sys, /不要反复用吃的、身份自述、口癖、缩写或抽象梗/);
     assert.doesNotMatch(sys, /大白饭|白米饭/);
@@ -104,7 +114,7 @@ test('自定义人设按已认证关系轻调语气，不强制敷衍或撒娇',
       assert.match(sys, /不必每句撒娇、叫主人或加波浪号/);
     } else {
       assert.match(sys, /当前发言者不是主人/);
-      assert.match(sys, /不因身份而冷落、敷衍/);
+      assert.match(sys, /不因身份而冷落或敷衍/);
       assert.doesNotMatch(sys, /当前发言者是已认证的主人/);
     }
   }

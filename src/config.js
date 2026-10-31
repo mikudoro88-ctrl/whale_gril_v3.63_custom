@@ -18,10 +18,10 @@ const PROVIDERS = {
   deepseek: {
     label: 'DeepSeek 官方（效果最好，按量付费）',
     baseUrl: 'https://api.deepseek.com',
-    model: 'deepseek-chat',
+    model: 'deepseek-flash',
     needsKey: true,
-    hint: '在 platform.deepseek.com 创建 Key，几块钱能用很久',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
+    hint: '在 platform.deepseek.com 创建 Key；deepseek-flash = DeepSeek-V4.1-Flash（1M 上下文，可看图），deepseek-v4-pro 更强更贵',
+    models: ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],
   },
   zhipu: {
     label: '智谱 GLM-4-Flash（免费）',

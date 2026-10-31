@@ -26,6 +26,11 @@ const websearch = require('./websearch');
 const { LlmError } = require('./llm');
 const { saveSettings } = require('./config');
 const personaStore = require('./personaStore');
+const selfEdit = require('./selfEdit');
+const mood = require('./mood');
+const cost = require('./cost');
+const access = require('./access');
+const archive = require('./archive');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -559,6 +564,28 @@ class Bot {
     // 后面生成的文本要判断「是不是在对主人说话」（例如不许带脏字回骂）
     msg.isMaster = isMaster;
 
+    // 情绪微调：先按这句话做规则打分（零延迟），必要时后台让模型按最近聊天归纳一次。
+    // 测试跑在 node --test 的子进程里（NODE_TEST_CONTEXT），不要写真实 data/mood.json。
+    let moodState = null;
+    if (hasText && !process.env.NODE_TEST_CONTEXT) {
+      try {
+        moodState = mood.bump(this.config, key, clean.text, { isMaster, chatType: msg.chatType });
+        if (mood.needsRefresh(moodState)) {
+          // 放到下一轮事件循环再跑：不占用这次回复的 LLM 调用，也不增加回复延迟
+          const snapshot = this.store.messages(key, 10);
+          setTimeout(() => {
+            mood
+              .refresh({ config: this.config, llm: this.llm, key, turns: snapshot, logger: this.logger })
+              .then((next) => { if (next && this.logger) this.logger.info(`[mood] ${key} → ${next.mood}（${next.intensity}/5）`); })
+              .catch(() => {});
+          }, 0);
+        }
+      } catch (err) {
+        this.logger && this.logger.warn('[mood] 更新情绪失败：' + ((err && err.message) || err));
+      }
+    }
+
+
     // 对别人的话仍然旁听存档，但不触发命令、回怼或接话。
     if (isGroup && msg.directedElsewhere) {
       return { action: 'ignore', key, msg, reason: 'addressed_to_other' };
@@ -815,7 +842,24 @@ class Bot {
       ].join('|'),
       'i'
     );
-    if (webOn && clean.text && searchPattern.test(clean.text)) {
+    // 问她「你是谁 / 你叫什么」是身份问题，不该联网（搜回来就会被答成助手腔）
+    const selfAsk = /(你是谁|你是啥|你谁啊|你谁呀|你叫啥|你叫什么|你名字|你是 ?ai|你是机器人|你是人吗|什么模型|介绍.{0,2}你自己?)/i.test(clean.text || '');
+    // 刚聊完某张图、她认不出来时，对方甩来一个名字（「尼古喵喵」这种）也要搜，
+    // 否则她只会凭训练数据否定人家。
+    let followUpNameAsk = false;
+    try {
+      const recent = this.store.messages(key, 4) || [];
+      const lastBot = [...recent].reverse().find((m) => m && m.role === 'assistant');
+      const lastBotText = lastBot ? String(lastBot.text || '') : '';
+      const t = String(clean.text || '');
+      followUpNameAsk = Boolean(
+        /(识图|认不|不确定|查不到|认错|哪张|哪部|出处|瞎说|瞎猜|猜的|没收到图|看不到|重发|认一遍|图里|这张图)/.test(lastBotText)
+        && t.length >= 2 && t.length <= 16
+        && !/[，。；！？!?,;\s]/.test(t)
+        && /[\u4e00-\u9fa5A-Za-z]/.test(t)
+      );
+    } catch (_) { /* 记忆读不到就不启用 */ }
+    if (webOn && clean.text && !selfAsk && (searchPattern.test(clean.text) || followUpNameAsk)) {
       try {
         const isWeather = /(天气|下雨|下雪|气温|多少度|冷不冷|热不热|台风|雾霾|空气)/.test(clean.text);
         let q = String(clean.text)
@@ -856,7 +900,11 @@ class Bot {
         // 实测：「苹果现在出到几了」加 2026 后，新文章(4/4)反而被官方首页挤掉(2/4)；
         // 时效性问题交给 dropStaleResults 按日期过滤，别机械加年份。
         const timeSensitive = /(最新|现在|今年|目前|当前|出到几|第几代|什么型号|哪个版本|刚出|新出)/.test(clean.text || q);
-        if (q && !isWeather && !/\d{4}/.test(q) && !timeSensitive) q += ' ' + now.getFullYear();
+        if (followUpNameAsk) {
+          // 对方给的是名字（作品/角色/品牌），别加年份，直接搜这个名字
+          q = String(clean.text).replace(/(是什么|是谁|吗|呢|吧|啊|呀|？|\?)/g, '').trim().slice(0, 40);
+        }
+        if (q && !isWeather && !followUpNameAsk && !/\d{4}/.test(q) && !timeSensitive) q += ' ' + now.getFullYear();
         if (/(新闻|热点|热搜|发生了什么|大事件|头条)/.test(clean.text)) {
           webText = await websearch.hotNewsText(8);
         }
@@ -963,6 +1011,8 @@ class Bot {
       profile,
       notes,
       now,
+      moodState,
+      archive: this._archiveSnapshot(key, msg.chatType),
     });
     const turns = this.buildTurns(msg, hasText ? history.slice(0, -1) : history);
 
@@ -1020,6 +1070,8 @@ class Bot {
       return { wake: false, reason: 'silent' };
     }
     if (isMaster && this.config.group.masterAlwaysReply) return { wake: true, reason: 'master' };
+    // masterAlwaysReply=false 时，主人在群里没 @ 也不接话（避免「接话窗口」一直续期 → 永远回）
+    if (isMaster) return { wake: false, reason: 'master_not_addressed' };
     if (Number(state.engagedUntil) > nowMs) {
       const txt = String(clean.text || '');
       const sameSender = String(msg.senderId || '') === String(state.engagedBy || '');
@@ -1122,6 +1174,23 @@ class Bot {
       return null;
     }
     const remaining = Math.max(1, Math.round(((Number(state.adminUntil) || nowMs) - nowMs) / 60000));
+
+    // —— 让她自己改人格：主人一句自然语言要求 → 模型重写 → 白名单校验 → 存进 data/persona.json ——
+    let se;
+    if ((se = text.match(/^(?:改人设|改人格|修改人设|修改人格|重写人设|自己改人设|自我修改人设|改一下你的人设|改一下人格)\s*[:：]?\s*([\s\S]{1,300})$/))
+        || (se = text.match(/^(?:把你自己改成|把你的人格改成|把你人设改成)\s*([\s\S]{1,300})$/))) {
+      const instruction = String(se[1]).trim().replace(/^[，,。.：:、\s]+/, '').trim();
+      if (instruction.length >= 2) {
+        return { action: 'selfedit', instruction, key, msg, atMe: true, reason: 'self_edit' };
+      }
+    }
+    if (/^(?:查看人设|现在的人设|人设是什么|看人设|你的人格)$/.test(text)) {
+      return say('现在的人格：\n' + selfEdit.describe(this.config));
+    }
+    if (/^(?:撤销人格|撤销人设修改|撤销人设|还原上一次人设|回退人设)$/.test(text)) {
+      const out = selfEdit.undo(this.config, this.logger);
+      return say(out.message);
+    }
 
     // —— 群禁言（让某个群安静） ——
     let mg;
@@ -1287,7 +1356,7 @@ class Bot {
       );
     }
     if (/^(管理)?帮助$/.test(text)) {
-      return say('管理员命令：状态 / 上下文 20 / 人味 高|中|低 / 情绪 开|关 / 主动 开|关 / 观点 开|关 / 语态 <描述> / 语气 温柔|活泼|高冷|毒舌|正经 / 长度 私聊 120 / 回复 短一点 / 颜文字 少|多|关 / 能力 链接 开|关 / 能力 主动接话 开|关 / 改模型 <模型名> / 演示模式 开|关 / 重置记忆 / 清空所有记忆 / 恢复默认 / 退出管理');
+      return say('管理员命令：改人设 <要求> / 查看人设 / 撤销人格 / 状态 / 上下文 20 / 人味 高|中|低 / 情绪 开|关 / 主动 开|关 / 观点 开|关 / 语态 <描述> / 语气 温柔|活泼|高冷|毒舌|正经 / 长度 私聊 120 / 回复 短一点 / 颜文字 少|多|关 / 能力 链接 开|关 / 能力 主动接话 开|关 / 改模型 <模型名> / 演示模式 开|关 / 重置记忆 / 清空所有记忆 / 恢复默认 / 退出管理');
     }
     if (/^演示模式\s*(开|打开|关|关闭|关掉)$/.test(text)) {
       const on = /开/.test(text);
@@ -1424,6 +1493,10 @@ class Bot {
       yield decision.text;
       return;
     }
+    if (decision.action === 'selfedit') {
+      yield await this.selfEditPersona(decision);
+      return;
+    }
     if (decision.canned) {
       yield decision.canned;
       return;
@@ -1470,6 +1543,24 @@ class Bot {
       if (this.logger) this.logger.warn('挑表情包失败：' + (err && err.message ? err.message : err));
       return null;
     }
+  }
+
+  /** 记忆分层总开关（config.archive.enabled === false 时整个关掉） */
+  _archiveEnabled() {
+    const a = this.config && this.config.archive;
+    return !(a && a.enabled === false);
+  }
+
+  /** 记忆分层：档案文件跟 store.json 放同一个目录 */
+  _archiveFile() {
+    const f = String((this.store && this.store.file) || '');
+    return f ? f.replace(/store\.json$/, 'archives.json') : 'data/archives.json';
+  }
+
+  /** 记忆分层：把档案压成提示词里的一小段 */
+  _archiveSnapshot(key, chatType) {
+    if (!this._archiveEnabled()) return '';
+    try { return archive.snapshot(this._archiveFile(), key, chatType || 'private'); } catch { return ''; }
   }
 
   finalize(decision, text, { error = false } = {}) {
@@ -1625,6 +1716,25 @@ class Bot {
         else if (bubbles.length) bubbles[bubbles.length - 1] = (bubbles[bubbles.length - 1] + ' ' + extra).trim();
       }
     }
+    // 活人感：单/双气泡概率（列表里配 dualBubbleChance，0=永远合一条）
+    const dualChance = Number(this.config.chat && this.config.chat.dualBubbleChance);
+    if (!error && bubbles.length > 1 && Number.isFinite(dualChance) && dualChance >= 0) {
+      if (this.rng() > dualChance) {
+        bubbles = [bubbles.join('，')];
+      }
+    }
+    // 开场白防复读：开头三个字跟最近几条太像就换个起手
+    if (!error && bubbles.length) {
+      const head = bubbles[0].slice(0, 3);
+      const opens = this._recentOpenings || (this._recentOpenings = []);
+      if (head.length >= 2 && opens.includes(head) && this.rng() < 0.8) {
+        const alts = ['嗯', '行', '哟', '欸', '嘿', '得', '咋'];
+        const alt = alts[Math.floor(this.rng() * alts.length)];
+        bubbles[0] = alt + '，' + bubbles[0];
+      }
+      opens.push(bubbles[0].slice(0, 3));
+      if (opens.length > 6) opens.shift();
+    }
     return bubbles;
   }
 
@@ -1632,7 +1742,29 @@ class Bot {
    * 非流式的完整处理，给微信/抖音网关用。
    * @returns {{action: string, reply?: string, bubbles?: string[], reason: string, commandType?: string}}
    */
+  /**
+   * 让她自己改人格：主人一句要求 → 模型重写成 JSON 补丁 → 白名单校验 → 存盘。
+   * 网页聊天（generate）和微信（handle）两条链路共用。
+   */
+  async selfEditPersona(decision) {
+    try {
+      const out = await selfEdit.run({ config: this.config, llm: this.llm, logger: this.logger }, decision.instruction);
+      return out.message;
+    } catch (err) {
+      this.logger && this.logger.error('自我修改人格失败：' + (err && err.stack ? err.stack : err));
+      return '我改到一半出错了，这次没存。';
+    }
+  }
+
   async handle(rawMsg, { signal } = {}) {
+    // 允许范围：白名单 / 逐聊天开关，先拦一道，降低误触发
+    const gate = access.check(this.config, rawMsg);
+    if (!gate.ok) {
+      this.logger && this.logger.info && this.logger.info('不在允许范围，跳过回复：' + gate.reason + ' ' + String((rawMsg && (rawMsg.chatKey || rawMsg.key)) || ''));
+      return { action: 'ignore', reason: 'not_allowed' };
+    }
+    // 记下本条消息开始前的累计用量，回复完用差值算这条花多少钱
+    const usageBefore = typeof this.llm.usageSnapshot === 'function' ? this.llm.usageSnapshot() : null;
     let decision;
     try {
       decision = await this.decide(rawMsg);
@@ -1647,6 +1779,11 @@ class Bot {
       const bubbles = this.finalize(decision, decision.text);
       return { action: 'reply', reply: decision.text, bubbles, reason: 'command', commandType: decision.commandType };
     }
+    if (decision.action === 'selfedit') {
+      const text = await this.selfEditPersona(decision);
+      const bubbles = this.finalize(decision, text);
+      return { action: 'reply', reply: text, bubbles, reason: 'self_edit', commandType: 'self_edit' };
+    }
     let text = '';
     try {
       if (decision.canned) {
@@ -1654,7 +1791,12 @@ class Bot {
       } else if (decision.mock) {
         text = decision.text;
       } else {
-        text = await this.llm.complete({ system: decision.system, turns: decision.turns });
+        // 动态温度：技术问题压低温度求稳，日常闲聊调高求活人感
+        const tempCfg = this.config.chat || {};
+        const askText = String((decision.msg && (decision.msg.cleanText || decision.msg.text)) || '');
+        const techy = /(代码|编程|python|node|javascript|typescript|报错|bug|算法|接口|数据库|sql|服务器|部署|配置|脚本|正则|测试|重构|函数|性能)/i.test(askText);
+        const temp = techy ? (Number(tempCfg.techTemperature) || 0.8) : (Number(tempCfg.chatTemperature) || 1.1);
+        text = await this.llm.complete({ system: decision.system, turns: decision.turns, temperature: temp });
         // 模型有时候只会把别人说过的话复读一遍，或者重复自己上一句，这种重写一次
         const heardList = this.recentHeard(decision);
         const ownList = this.recentOwn(decision);
@@ -1720,11 +1862,34 @@ class Bot {
     text = String(text == null ? '' : text).trim();
     const bubbles = this.finalize(decision, text);
     if (!bubbles.length) return { action: 'ignore', reason: 'empty_reply' };
+    // 在最后一条气泡下面补一行「本次消耗」，让主人心里有数
+    if (usageBefore && typeof this.llm.usageSnapshot === 'function') {
+      const after = this.llm.usageSnapshot();
+      const delta = {
+        input: after.input - usageBefore.input,
+        output: after.output - usageBefore.output,
+        cacheHit: after.cacheHit - usageBefore.cacheHit,
+        cacheMiss: after.cacheMiss - usageBefore.cacheMiss,
+      };
+      const tail = cost.line(this.config, delta, Date.now());
+      if (tail) bubbles[bubbles.length - 1] = bubbles[bubbles.length - 1] + tail;
+    }
     // 群里骂人时要真 @ 到对方：优先用靶子，其次看正文开头有没有 @名字
     const finalText = decision.finalText || text;
     const atMatch = finalText.match(/^@\s*([^\s，,：:！!？?。]+)/);
     const mention = (decision.msg && decision.msg.fightTarget && decision.msg.fightTarget.name)
       || (atMatch ? atMatch[1] : '');
+    try {
+      const m = decision.msg || {};
+      if (this._archiveEnabled()) archive.bump(this._archiveFile(), {
+        key: decision.key,
+        chatType: m.chatType,
+        senderId: m.senderId || m.senderUsername || '',
+        senderName: m.senderName || '',
+        text: String(m.cleanText || m.text || ''),
+        isGroup: m.chatType === 'group',
+      });
+    } catch { /* 档案写失败不影响回复 */ }
     return {
       action: 'reply',
       reply: finalText,

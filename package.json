@@ -26,9 +26,10 @@
         "llm"
     ],
     "license": "MIT",
-    "author": "",
+    "author": "Banan1cee (upstream) / fork maintainer",
     "repository": {
         "type": "git",
-        "url": ""
-    }
+        "url": "https://github.com/<你的用户名>/whale-girl.git"
+    },
+    "homepage": "https://github.com/<你的用户名>/whale-girl"
 }

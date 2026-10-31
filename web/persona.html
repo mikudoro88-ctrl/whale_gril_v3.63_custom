@@ -106,6 +106,19 @@
   </div>
 
   <div class="card">
+    <h2>让她自己改人格</h2>
+    <p class="hint">写一句要求，她自己把人格提示词重写一遍再保存（比如「说话再毒一点，别老卖萌」「以后叫我老大」）。改完立即生效；不满意点右边撤销。</p>
+    <label style="margin-top:8px">要她怎么改？
+      <textarea id="selfEditText" maxlength="300" placeholder="例如：说话再毒一点，别老卖萌；被夸也别客气" style="min-height:70px"></textarea>
+    </label>
+    <div class="actions" style="margin-top:10px">
+      <button type="button" class="primary" id="selfEditBtn">让她改</button>
+      <button type="button" class="btn" id="selfUndoBtn">撤销上一次改动</button>
+      <span class="hint" id="selfEditHint"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>上下文 / 记忆长度</h2>
     <label>私聊上下文：<span class="val" id="htVal">200</span> 条
       <input type="range" id="historyTurns" min="4" max="400" step="2" />
@@ -279,6 +292,40 @@ async function save() {
     toast('保存失败');
   }
 }
+
+// 「让她自己改人格」：一句话要求 → 模型重写 → 存进 data/persona.json
+async function selfEdit() {
+  const instruction = $('selfEditText').value.trim();
+  if (!instruction) { toast('先写一句想让她怎么改'); return; }
+  $('selfEditBtn').disabled = true;
+  $('selfEditHint').textContent = '她自己正在改…（要调模型，等十几秒）';
+  try {
+    const r = await fetch('/api/persona/selfedit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instruction }),
+    });
+    const d = await r.json();
+    if (d.ok && d.persona) { fill(d.persona, null); showSourcePreset(d.persona); }
+    $('selfEditHint').textContent = d.message || d.error || (d.ok ? '改好了' : '没改成');
+    toast(d.ok ? '她改好了' : '没改成');
+  } catch (err) {
+    $('selfEditHint').textContent = '请求失败：' + err.message;
+  } finally {
+    $('selfEditBtn').disabled = false;
+  }
+}
+
+async function selfUndo() {
+  const r = await fetch('/api/persona/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  const d = await r.json();
+  if (d.ok && d.persona) { fill(d.persona, null); showSourcePreset(d.persona); }
+  $('selfEditHint').textContent = d.message || (d.ok ? '已撤销' : '没有可撤销的记录');
+  toast(d.ok ? '已撤销' : '没有可撤销的记录');
+}
+
+$('selfEditBtn').addEventListener('click', selfEdit);
+$('selfUndoBtn').addEventListener('click', selfUndo);
 
 $('historyTurns').addEventListener('input', (e) => { $('htVal').textContent = e.target.value; });
 $('groupHistoryTurns').addEventListener('input', (e) => { $('ghtVal').textContent = e.target.value; });

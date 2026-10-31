@@ -46,10 +46,13 @@ test('表情包发了装死：不识别、不回话', () => {
   assert.doesNotMatch(bridge, /def screenshot_sticker/, '表情包截图兜底要删掉');
   assert.doesNotMatch(bridge, /def _find_sticker_file/, '表情包找缓存要删掉');
   assert.doesNotMatch(bridge, /def _sticker_label/, '表情包取名要删掉');
-  assert.match(bridge, /收到表情包，装死/, '要写清是装死');
+  assert.match(bridge, /收到表情包/, '要写清是装死');
+  assert.match(bridge, /def sticker_busy_reply/, '表情包彩蛋函数要在');
+  assert.match(bridge, /STICKER_BUSY_CHANCE/, '要有概率常量');
+  assert.match(bridge, /stickerBusy/, '要能读配置里的 stickerBusy');
   const fn = bridge.slice(bridge.indexOf('def on_message_inner'));
   const body = fn.slice(0, fn.indexOf('\n    def ', 10));
-  assert.match(body, /表情包发了装死/, '处理分支里要说明为什么装死');
+  assert.match(body, /sticker_busy_reply\(username\)/, '装死分支要交给表情包彩蛋判断（30% 回服务器繁忙）');
   assert.doesNotMatch(body, /describe_sticker\(msg\)/, '不能再调用识别');
 });
 
@@ -61,7 +64,8 @@ test('被标成「图片」的表情包也要装死，不能送视觉模型', ()
   assert.match(body, /if "<emoji" in content:/, '要按正文里的 emoji XML 兜底');
   assert.ok(body.indexOf('if "<emoji" in content:') < body.indexOf('describe_image(msg)'),
     '兜底必须排在图片识别之前');
-  assert.match(body, /收到表情包（被标成图片），装死/, '要留下日志');
+  assert.match(body, /收到表情包（被标成图片）/, '要留下日志');
+  assert.match(body, /sticker_busy_reply\(username\)/, '图片型表情包也要走彩蛋');
 });
 test('UIA 彻底不行时有键盘兜底通道（Ctrl+F 搜索会话 → 粘贴 → 回车，并回读确认）', () => {
   assert.match(bridge, /def keyboard_send/);

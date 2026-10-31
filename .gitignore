@@ -32,3 +32,8 @@ scripts/node-path.local
 # 桥接 OCR 的临时截图
 wechatauto_ocr_tmp.png
 
+# 本地补丁与备份（不进库）
+*.bak
+*.bak-*
+*.pyc
+__pycache__/

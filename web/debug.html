@@ -91,6 +91,19 @@
     font-size:12px; background:#7f1d1d; border-color:#fca5a5; color:#fff; }
 
 
+  /* 新功能开关卡片：排版与上面「全部设置」一致 */
+  #ntBody .sec { border:1px solid var(--line); border-radius:14px; padding:12px 14px; background:rgba(2,14,26,.35); margin-bottom:12px; }
+  #ntBody .sec > h3 { margin:0 0 4px; font-size:14px; color:var(--cyan); }
+  #ntBody .secHint { margin:0 0 10px; font-size:12px; color:var(--dim); }
+  #ntBody .fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px 16px; }
+  #ntBody .field > label { display:block; font-size:12.5px; color:var(--dim); margin-bottom:4px; }
+  #ntBody .field.wide { grid-column:1/-1; }
+  #ntBody .field .hint { font-size:11.5px; color:rgba(169,207,228,.72); margin-top:4px; line-height:1.5; }
+  #ntBody input[type=number], #ntBody select { width:100%; }
+  #ntBody input[type=checkbox] { width:16px; height:16px; accent-color:var(--cyan); margin:0; }
+  #ntBody textarea { width:100%; font-size:12.5px; line-height:1.5; font-family:ui-monospace,Consolas,monospace; }
+  #ntBody .switch { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); }
+  #ntBody .switch span { font-size:13px; }
 </style>
 </head>
 <body>
@@ -167,6 +180,17 @@
     <h2>功能开关（新功能都在这里，可开可关）</h2>
     <p class="muted">表情包总开关在页面顶部。其他功能开关列在这里；改动会保存，重启也还在。群聊相关的两个开关要重启桥接/服务才完全生效。</p>
     <table id="tFeatures"><tr><td class="muted">加载中…</td></tr></table>
+  </div>
+
+  <div class="card" id="ntCard">
+    <h2>新功能开关（这一批新增的都在这里）</h2>
+    <p class="muted">白名单 / 记忆分层 / 活人感 / 群聊批处理 / 打字停顿 / 图片处理 / 识图 / DSH 复核 / 费用显示。改完点下面「保存这些开关」，绝大多数立即生效；群聊批处理和打字停顿要重开一次「启动微信桥接.bat」窗口。</p>
+    <div id="ntBody"><p class="muted">加载中…</p></div>
+    <div class="row">
+      <button id="ntSaveBtn">保存这些开关</button>
+      <button id="ntReloadBtn">重新读一次</button>
+      <span id="ntMsg" class="muted"></span>
+    </div>
   </div>
 
   <div class="card">
@@ -250,7 +274,7 @@ const META = {
   'group.freeChat': ['允许她偶尔主动接话', '只在上面开着时有用：按下面的概率在群里插一句，不会每条都接'],
   'group.freeChatChance': ['主动接话概率', '0~1；0.06 = 6%'],
   'group.cooldownSec': ['两次回复最少间隔（秒）', ''],
-  'group.masterAlwaysReply': ['主人在群里说话永远回', ''],
+  'group.masterAlwaysReply': ['主人在群里说话永远回', '开 = 主人在群里说啥都回；关 = 群里没 @ 就不接话（接话窗口也不会为这条续期）'],
   'group.engagedMinutes': ['接话后保持参与多少分钟', ''],
   'group.silentMinutes': ['冷场多少分钟算话题结束', ''],
   'group.maxRepliesPerHour': ['每小时最多回几条', '防刷屏'],
@@ -276,6 +300,9 @@ const META = {
   'share.enabled': ['主动分享视频', ''],
   'share.everyMinutes': ['每隔多少分钟分享一次', ''],
   'share.sources': ['来源', '一行一个，目前支持 bilibili'],
+  'share.sendVideo': ['发视频文件', '开=下载完整视频发过去（超过上限就退回发链接）'],
+  'share.videoMaxMB': ['视频大小上限（MB）', '超过就改发链接'],
+  'share.quality': ['清晰度', '64=720P，32=360P（越小越快）'],
   'care.enabled': ['主动找你聊天', '没事的时候她会自己发一条，问问你在干啥、累不累'],
   'care.windows': ['允许搭话的时间段', '一行一个，24 小时制，格式 09:00-12:00；跨零点也认（22:00-02:00）；留空 = 全天'],
   'care.everyMinutes': ['平均多久搭一次话（分钟）', '90 = 大约一个半小时；这是平均值，会加上下面的浮动'],
@@ -1213,6 +1240,201 @@ window.addEventListener('beforeunload', (e) => {
   loadFeatures();
   loadState();
   loadSessions();
+})();
+/* ===== 新功能开关（这一批增强） ===== */
+(function () {
+  const GROUPS = [
+    {
+      title: '① 允许范围（谁可以跟她说话）',
+      hint: '关掉「启用」= 谁都回；「只回名单」= 只回下面 JSON 里列出的会话。会话 key 形如 wechat:u:wxid_xxx 、wechat:g:123@chatroom。',
+      items: [
+        { path: 'access.enabled', label: '启用允许范围', type: 'bool' },
+        { path: 'access.mode', label: '模式', type: 'select', options: [['all', '谁都可以聊'], ['whitelist', '只回名单']] },
+        { path: 'access.chats', label: '名单', type: 'json', hint: '例：{"wechat:u:wxid_abc":{"mode":"full"},"wechat:g:123@chatroom":{"mode":"off"}}；mode：chat=只聊 / full=可下指令 / off=不理' },
+      ],
+    },
+    {
+      title: '② 记忆分层',
+      hint: '私聊记「TA 说过的事」，群聊记群话题 + 群友印象，压成一段塞进提示词（不占聊天记录额度）。',
+      items: [
+        { path: 'archive.enabled', label: '启用记忆档案', type: 'bool' },
+      ],
+    },
+    {
+      title: '③ 活人感',
+      hint: '双气泡概率：多句时合并成一条的概率（0=全拆开，1=全合并）。温度：越高越发散，技术题用低一点的温度更稳。',
+      items: [
+        { path: 'chat.dualBubbleChance', label: '双气泡概率', type: 'num', min: 0, max: 1, step: 0.05 },
+        { path: 'chat.chatTemperature', label: '闲聊温度', type: 'num', min: 0, max: 2, step: 0.05 },
+        { path: 'chat.techTemperature', label: '技术话题温度', type: 'num', min: 0, max: 2, step: 0.05 },
+      ],
+    },
+    {
+      title: '④ 群聊批处理（要重开桥接窗口）',
+      hint: '群里短时间内的多条消息合成一条再回，像真人在看刷屏。窗口越大越像人，但回复也越慢。',
+      items: [
+        { path: 'wechat.batch.enabled', label: '启用批处理', type: 'bool' },
+        { path: 'wechat.batch.windowSec', label: '合并窗口（秒）', type: 'num', min: 0, max: 10, step: 0.5 },
+        { path: 'wechat.batch.maxMessages', label: '最多合并条数', type: 'num', min: 1, max: 20, step: 1 },
+      ],
+    },
+    {
+      title: '⑤ 打字停顿（要重开桥接窗口）',
+      hint: '发消息前按字数停顿，模拟正在打字。每字秒 × 字数，超过上限就按上限。',
+      items: [
+        { path: 'wechat.liveness.typing', label: '启用打字停顿', type: 'bool' },
+        { path: 'wechat.liveness.perCharSec', label: '每字秒', type: 'num', min: 0, max: 0.2, step: 0.005 },
+        { path: 'wechat.liveness.typingMaxSec', label: '停顿上限（秒）', type: 'num', min: 0, max: 5, step: 0.1 },
+      ],
+    },
+    {
+      title: '⑥ 图片处理（要重开桥接窗口）',
+      hint: '收到图片先问「要拿它做什么」；群里用真 @ 还是纯文本 @；文档/截图是否只读文字不联网。',
+      items: [
+        { path: 'wechat.imageAsk.enabled', label: '收到图片先问用途', type: 'bool' },
+        { path: 'wechat.imageAsk.atUi', label: '群里用真 @（关=纯文本）', type: 'bool' },
+        { path: 'wechat.imageAsk.docNoSearch', label: '文档/截图只读字不联网', type: 'bool' },
+      ],
+    },
+    {
+      title: '⑦ 识图',
+      hint: '看图思考：off 快 5 秒且信息量几乎不变；low 会先写思考链。以图搜图 = trace.moe + SauceNAO；特征搜索 = 用画面关键词搜网页。',
+      items: [
+        { path: 'vision.thinking', label: '看图思考', type: 'select', options: [['off', '关（快）'], ['low', '开（慢）']] },
+        { path: 'vision.webSearch.enabled', label: '看图后联网补充', type: 'bool' },
+        { path: 'vision.webSearch.reverseSearch', label: '以图搜图', type: 'bool' },
+        { path: 'vision.webSearch.descSearch', label: '画面特征搜索', type: 'bool' },
+      ],
+    },
+    {
+      title: '⑧ DSH 复核（难图兜底）',
+      hint: '看图描述优先用 DSH 那条更强链路；认不出时再让 DSH 联网复核一遍。关掉可以省时间，难图准确率会掉。',
+      items: [
+        { path: 'dshBridge.enabled', label: '启用 DSH 链路', type: 'bool' },
+        { path: 'dshBridge.describe', label: '用 DSH 看图描述', type: 'bool' },
+        { path: 'dshBridge.fallback', label: '难图兜底复核', type: 'bool' },
+        { path: 'dshBridge.maxSearches', label: '复核最多搜索次数', type: 'num', min: 1, max: 5, step: 1 },
+      ],
+    },
+    {
+      title: '⑨ 费用显示',
+      hint: '每条回复下一行附本次消耗（如 （0.0010））。',
+      items: [
+        { path: 'pricing.enabled', label: '显示每条回复费用', type: 'bool' },
+      ],
+    },
+  ];
+
+  function getPath(obj, path) {
+    return String(path).split('.').reduce(function (o, k) { return (o == null ? undefined : o[k]); }, obj);
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function control(item, val) {
+    const p = esc(item.path);
+    if (item.type === 'bool') {
+      const checked = val === true ? ' checked' : '';
+      return '<label class="switch"><input type="checkbox" data-nt="' + p + '" data-nt-type="bool"' + checked + '><span>' + (val === true ? '开' : '关') + '</span></label>';
+    }
+    if (item.type === 'num') {
+      const extra = (item.min != null ? ' min="' + item.min + '"' : '') + (item.max != null ? ' max="' + item.max + '"' : '') + (item.step != null ? ' step="' + item.step + '"' : '');
+      return '<input type="number" data-nt="' + p + '" data-nt-type="num" value="' + esc(val == null ? '' : val) + '"' + extra + '>';
+    }
+    if (item.type === 'select') {
+      let html = '<select data-nt="' + p + '" data-nt-type="text">';
+      for (const opt of item.options) {
+        const v = String(opt[0]);
+        html += '<option value="' + esc(v) + '"' + (String(val) === v ? ' selected' : '') + '>' + esc(opt[1]) + '</option>';
+      }
+      return html + '</select>';
+    }
+    return '<textarea data-nt="' + p + '" data-nt-type="json" rows="3">' + esc(val == null ? '' : JSON.stringify(val, null, 1)) + '</textarea>';
+  }
+  function render(cfg) {
+    const host = document.getElementById('ntBody');
+    if (!host) return;
+    let html = '';
+    for (const g of GROUPS) {
+      html += '<div class="sec"><h3>' + esc(g.title) + '</h3>' + (g.hint ? '<p class="secHint">' + esc(g.hint) + '</p>' : '') + '<div class="fields">';
+      for (const item of g.items) {
+        const wide = item.type === 'json';
+        html += '<div class="field' + (wide ? ' wide' : '') + '"><label>' + esc(item.label) + '</label>' + control(item, getPath(cfg, item.path)) +
+          (item.hint ? '<div class="hint">' + esc(item.hint) + '</div>' : '') + '</div>';
+      }
+      html += '</div></div>';
+    }
+    host.innerHTML = html;
+    const boxes = host.querySelectorAll('.switch input[type=checkbox]');
+    for (const cb of boxes) {
+      const sync = function () {
+        const sp = cb.parentElement && cb.parentElement.querySelector('span');
+        if (sp) sp.textContent = cb.checked ? '开' : '关';
+      };
+      cb.addEventListener('change', sync);
+      sync();
+    }
+  }
+  async function load() {
+    const msg = document.getElementById('ntMsg');
+    if (msg) msg.innerHTML = '<span class="muted">加载中…</span>';
+    try {
+      const r = await fetch('/api/config');
+      const d = await r.json();
+      render(d.config || d);
+      if (msg) msg.innerHTML = '';
+    } catch (e) {
+      if (msg) msg.innerHTML = '<span class="bad">读配置失败：' + esc(e && e.message) + '</span>';
+    }
+  }
+  async function save() {
+    const msg = document.getElementById('ntMsg');
+    const btn = document.getElementById('ntSaveBtn');
+    const patch = {};
+    const errs = [];
+    document.querySelectorAll('[data-nt]').forEach(function (el) {
+      const path = el.getAttribute('data-nt');
+      const type = el.getAttribute('data-nt-type');
+      if (type === 'bool') { patch[path] = !!el.checked; return; }
+      if (type === 'num') {
+        const v = Number(el.value);
+        if (el.value === '' || Number.isNaN(v)) { errs.push(path); return; }
+        patch[path] = v;
+        return;
+      }
+      if (type === 'json') {
+        const t = String(el.value || '').trim();
+        if (!t) { patch[path] = {}; return; }
+        try { patch[path] = JSON.parse(t); } catch (e) { errs.push(path + '（JSON 格式不对）'); }
+        return;
+      }
+      patch[path] = el.value;
+    });
+    if (errs.length) {
+      if (msg) msg.innerHTML = '<span class="bad">这些填的不对：' + esc(errs.join('、')) + '</span>';
+      return;
+    }
+    if (btn) btn.disabled = true;
+    if (msg) msg.innerHTML = '<span class="muted">保存中…</span>';
+    try {
+      const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ patch: patch }) });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || '未知错误');
+      render(d.config || {});
+      if (msg) msg.innerHTML = '<span class="ok">已保存 ' + (d.changedSettings || Object.keys(patch)).length + ' 项并生效</span>';
+    } catch (e) {
+      if (msg) msg.innerHTML = '<span class="bad">保存失败：' + esc(e && e.message) + '</span>';
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+  window.addEventListener('DOMContentLoaded', function () {
+    const btn = document.getElementById('ntSaveBtn');
+    if (btn) btn.addEventListener('click', save);
+    const re = document.getElementById('ntReloadBtn');
+    if (re) re.addEventListener('click', load);
+    if (document.getElementById('ntCard')) load();
+  });
 })();
 </script>
 </body>

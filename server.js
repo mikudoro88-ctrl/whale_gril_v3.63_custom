@@ -24,6 +24,8 @@ const persona = require('./src/persona');
 const care = require('./src/care');
 const { matchMaster, masterWarnings } = require('./src/master');
 const personaStore = require('./src/personaStore');
+const selfEdit = require('./src/selfEdit');
+const mood = require('./src/mood');
 const memoryBackup = require('./src/memoryBackup');
 const mediaCache = require('./src/mediaCache');
 const features = require('./src/features');
@@ -33,6 +35,8 @@ const presets = require('./src/presets');
 const links = require('./src/links');
 const bilibili = require('./src/bilibili');
 const vision = require('./src/vision');
+const imageSearch = require('./src/imageSearch');
+const dshBridge = require('./src/dshBridge');
 
 const VERSION = require('./package.json').version;
 const MAX_BODY = 2 * 1024 * 1024;
@@ -900,6 +904,8 @@ async function debugPrompt(runtime, body) {
     profile: { count: 1, notes: [] },
     notes: [],
     now: new Date(),
+    // 调试台如果给了 key，就把这个会话此刻的情绪也拼进去（只读，不写盘）
+    moodState: body.key ? mood.peek(config, String(body.key)) : null,
   });
   return {
     ok: true,
@@ -1476,13 +1482,124 @@ function createHandler(runtime) {
 
       if (pathname === '/api/vision' && method === 'POST') {
         try {
-          const body = await readBody(req);
-          const text = await vision.describe(runtime.config, {
-            imageBase64: body && body.image,
-            mime: (body && body.mime) || 'image/jpeg',
-            prompt: (body && body.prompt) || '',
+          // 微信原图 base64 后常有 2~6MB，默认 2MB 上限会直接 413
+          const body = await readBody(req, 8 * 1024 * 1024);
+          const imageBase64 = (body && body.image) || '';
+          const mime = (body && body.mime) || 'image/jpeg';
+          const promptText = String((body && body.prompt) || '').trim();
+          const imgBuf = imageBase64 ? Buffer.from(imageBase64, 'base64') : null;
+          // 两条看图通道并行：deepseek-flash（约 8 秒）与 DSH 原生多模态（约 6 秒）。
+          // DSH 的描述更细、还带「可检索特征」，优先用它；失败或超时自动退回 flash。
+          let dshDesc = null;
+          let flashText = '';
+          if (!promptText) {
+            const [flashRes, dshRes] = await Promise.allSettled([
+              vision.describe(runtime.config, { imageBase64, mime, prompt: '' }),
+              imgBuf ? dshBridge.describeImage(runtime.config, { buffer: imgBuf, mime }) : Promise.resolve(null),
+            ]);
+            if (flashRes.status === 'fulfilled') flashText = String(flashRes.value || '');
+            if (dshRes.status === 'fulfilled') dshDesc = dshRes.value;
+          } else {
+            flashText = await vision.describe(runtime.config, { imageBase64, mime, prompt: promptText });
+          }
+          const text = dshDesc && dshDesc.text ? dshDesc.text : flashText;
+          if (!String(text || '').trim()) throw new Error('看图没有得到任何描述');
+          // 看图之后顺手联网搜一下图里的东西（游戏、角色、梗、商品…），
+          // 长截图分段（prompt 非空）不搜，避免把整段 OCR 文字当查询词
+          let finalText = text;
+          let search = null;
+          let researchP = null; // 提前起跑的 DSH 复核（与识图核对并行）
+          if (!promptText) {
+            const visionParams = {
+              llm: runtime.llm,
+              imageBase64,
+              mime,
+            };
+            // 提速：先花约 2 秒做一次以图搜图探测。命中够强（≥0.90）就不必另开 DSH 复核；
+            // 弱的话立刻让 DSH 复核与识图核对并行跑，省掉「先等识图、再等复核」的串行等待。
+            if (imgBuf && dshBridge && typeof dshBridge.enabled === 'function' && dshBridge.enabled(runtime.config)) {
+              try {
+                const quick = await imageSearch.traceMoe(runtime.config, imageBase64, mime, 0.9);
+                const quickSim = quick && quick.similarity ? quick.similarity : 0;
+                if (quickSim < 0.9) {
+                  researchP = dshBridge.researchImage(runtime.config, {
+                    buffer: imgBuf,
+                    mime,
+                    description: text,
+                    hint: '画面特征：' + String(text || '').replace(/\s+/g, ' ').slice(0, 160) + '; 以图搜图候选（可能误配，待核）：' + (quick && quick.title ? String(quick.title) : '（无）'),
+                  }).catch(() => null);
+                }
+              } catch (_) { /* 探测失败就退回串行兜底 */ }
+            }
+            // 先做识图核对：以图搜图 → 候选 → 交叉核对画面特征，够了才下结论；
+            // 核对不了会明确告诉模型「别硬猜」，比让它自信报错作品名强。
+            try {
+              let extra = await imageSearch.identify(runtime.config, text, visionParams);
+              if (!extra) extra = await imageSearch.enrich(runtime.config, text, visionParams);
+              if (extra) {
+                search = { query: extra.query, hits: extra.hits, source: extra.source, confidence: extra.confidence };
+                if (extra.text) finalText = String(text || '') + extra.text;
+              }
+            } catch (err) {
+              runtime.logger && runtime.logger.warn('识图核对失败：' + String((err && err.message) || err));
+            }
+          }
+          // 疑难图兜底：识图链路自己都拿不准时，叫 DSH 再做一次「看图 + 受限联网核对」。
+          // 只有普通单图才走（长截图分段不兜底），最坏也就多 ~90 秒，且每次识图最多一次。
+          let dshResearch = null;
+          if (!promptText && imgBuf && search
+            && (search.source === 'none' || search.source === 'unverified' || search.confidence === 'low')) {
+            try {
+              const researchHint = '画面特征：' + String(text || '').replace(/\s+/g, ' ').slice(0, 160) + '; 以图搜图候选（可能误配）：' + ((search && search.query) ? String(search.query) : '（无）');
+              // 复核最多再等 30 秒：超过就先按现有结论回复，别把整条消息拖到 90 秒
+              const withCap = (p) => Promise.race([p, new Promise((r) => setTimeout(() => r(null), 55000))]);
+              dshResearch = researchP
+                ? await withCap(researchP)
+                : await withCap(dshBridge.researchImage(runtime.config, { buffer: imgBuf, mime, description: text, hint: researchHint }));
+              if (dshResearch && dshResearch.ok && dshResearch.conclusion) {
+                const lines = ['【DSH 复核（另一套链路：更强模型 + 联网，仅供参考）】'];
+                lines.push('结论：' + dshResearch.conclusion);
+                if (dshResearch.evidence) lines.push('依据：' + dshResearch.evidence);
+                if (dshResearch.confidence) lines.push('置信度：' + dshResearch.confidence);
+                const strong = dshResearch.confidence === '高' || dshResearch.confidence === '中';
+                if (search.source !== 'verified') {
+                  lines.push(strong
+                    ? '（这条来自独立链路、置信度' + (dshResearch.confidence || '中') + '，上面的以图搜图疑似结果可信度低 —— 优先采用这条复核结论；但仍要说「应该是」而不是绝对肯定。）'
+                    : '（这条来自独立链路；和上面的描述冲突时以你看到的画面为准，拿不准就说不太确定。）');
+                }
+                finalText = String(finalText || '') + '\n' + lines.join('\n');
+            // DSH 复核给出中/高置信、且否认了以图搜图的候选 → 把那段「疑似 xxx（很可能是认错）」删掉，
+            // 免得她一边看到正确结论、一边又照着疑似候选说错作品。
+            if (dshResearch && dshResearch.ok && (dshResearch.confidence === '高' || dshResearch.confidence === '中')) {
+              finalText = finalText
+                .split('\n')
+                .filter(function (ln) {
+                  const t = String(ln).trim();
+                  if (/^以图搜图说：/.test(t)) return false;
+                  if (/^（另外核对过：/.test(t)) return false;
+                  if (/^（说话时必须带/.test(t)) return false;
+                  return true;
+                })
+                .join('\n')
+                .replace(/【识图：疑似[^】]*】/g, '')
+                .replace(/\n{3,}/g, '\n\n');
+            }
+              }
+            } catch (err) {
+              runtime.logger && runtime.logger.warn('DSH 复核失败：' + String((err && err.message) || err));
+            }
+          }
+          return json(res, 200, {
+            ok: true,
+            text: finalText,
+            search,
+            dsh: {
+              describeMs: dshDesc && dshDesc.ms ? dshDesc.ms : null,
+              describeOk: !!(dshDesc && dshDesc.text),
+              researchMs: dshResearch && dshResearch.ms ? dshResearch.ms : null,
+              researchConfidence: dshResearch && dshResearch.confidence ? dshResearch.confidence : '',
+            },
           });
-          return json(res, 200, { ok: true, text });
         } catch (err) {
           runtime.logger.warn('图片识别失败：' + (err && err.message));
           return json(res, 500, { ok: false, error: String((err && err.message) || err) });
@@ -1506,6 +1623,19 @@ function createHandler(runtime) {
         return json(res, 200, buildDigest(items));
       }
 
+      // 此刻情绪：按会话 key 查；不带 key 就把最近有情绪的列出来
+      if (pathname === '/api/mood' && method === 'GET') {
+        const q = new URL(req.url, 'http://localhost');
+        const key = String(q.searchParams.get('key') || '').trim();
+        if (key) return json(res, 200, { ok: true, ...mood.describe(runtime.config, key) });
+        return json(res, 200, { ok: true, items: mood.list(runtime.config) });
+      }
+      // 手动把某个会话的情绪清回「平静」（body.key 为空 = 全部清空）
+      if (pathname === '/api/mood/reset' && method === 'POST') {
+        const body = await readBody(req);
+        const key = String((body && body.key) || '').trim();
+        return json(res, 200, { ok: true, ...mood.reset(runtime.config, key) });
+      }
       if (pathname === '/api/persona' && method === 'GET') {
         return json(res, 200, { ok: true, persona: personaStore.summary(runtime.config), llm: { provider: runtime.llm.provider, providerLabel: runtime.llm.providerLabel, model: runtime.llm.model, mock: runtime.llm.isMock } });
       }
@@ -1546,6 +1676,19 @@ function createHandler(runtime) {
           applied: { id: preset.id, version: preset.version || '', name: preset.name || '' },
           persona: personaStore.summary(runtime.config),
         });
+      }
+
+      // 「让她自己改人格」：调教台／网页里的一句话输入框
+      if (pathname === '/api/persona/selfedit' && method === 'POST') {
+        const body = await readBody(req);
+        const instruction = String((body && body.instruction) || '').trim();
+        if (!instruction) return json(res, 400, { ok: false, error: '想让她怎么改？写一句要求' });
+        const out = await selfEdit.run({ config: runtime.config, llm: runtime.llm, logger: runtime.logger }, instruction);
+        return json(res, 200, { ...out, persona: personaStore.summary(runtime.config) });
+      }
+      if (pathname === '/api/persona/undo' && method === 'POST') {
+        const out = selfEdit.undo(runtime.config, runtime.logger);
+        return json(res, 200, { ...out, persona: personaStore.summary(runtime.config) });
       }
 
       // ---- 微信多账号：列账号 / 刷新昵称 / 选账号 ----
@@ -1698,13 +1841,124 @@ function createHandler(runtime) {
 
       if (pathname === '/api/vision' && method === 'POST') {
         try {
-          const body = await readBody(req);
-          const text = await vision.describe(runtime.config, {
-            imageBase64: body && body.image,
-            mime: (body && body.mime) || 'image/jpeg',
-            prompt: (body && body.prompt) || '',
+          // 微信原图 base64 后常有 2~6MB，默认 2MB 上限会直接 413
+          const body = await readBody(req, 8 * 1024 * 1024);
+          const imageBase64 = (body && body.image) || '';
+          const mime = (body && body.mime) || 'image/jpeg';
+          const promptText = String((body && body.prompt) || '').trim();
+          const imgBuf = imageBase64 ? Buffer.from(imageBase64, 'base64') : null;
+          // 两条看图通道并行：deepseek-flash（约 8 秒）与 DSH 原生多模态（约 6 秒）。
+          // DSH 的描述更细、还带「可检索特征」，优先用它；失败或超时自动退回 flash。
+          let dshDesc = null;
+          let flashText = '';
+          if (!promptText) {
+            const [flashRes, dshRes] = await Promise.allSettled([
+              vision.describe(runtime.config, { imageBase64, mime, prompt: '' }),
+              imgBuf ? dshBridge.describeImage(runtime.config, { buffer: imgBuf, mime }) : Promise.resolve(null),
+            ]);
+            if (flashRes.status === 'fulfilled') flashText = String(flashRes.value || '');
+            if (dshRes.status === 'fulfilled') dshDesc = dshRes.value;
+          } else {
+            flashText = await vision.describe(runtime.config, { imageBase64, mime, prompt: promptText });
+          }
+          const text = dshDesc && dshDesc.text ? dshDesc.text : flashText;
+          if (!String(text || '').trim()) throw new Error('看图没有得到任何描述');
+          // 看图之后顺手联网搜一下图里的东西（游戏、角色、梗、商品…），
+          // 长截图分段（prompt 非空）不搜，避免把整段 OCR 文字当查询词
+          let finalText = text;
+          let search = null;
+          let researchP = null; // 提前起跑的 DSH 复核（与识图核对并行）
+          if (!promptText) {
+            const visionParams = {
+              llm: runtime.llm,
+              imageBase64,
+              mime,
+            };
+            // 提速：先花约 2 秒做一次以图搜图探测。命中够强（≥0.90）就不必另开 DSH 复核；
+            // 弱的话立刻让 DSH 复核与识图核对并行跑，省掉「先等识图、再等复核」的串行等待。
+            if (imgBuf && dshBridge && typeof dshBridge.enabled === 'function' && dshBridge.enabled(runtime.config)) {
+              try {
+                const quick = await imageSearch.traceMoe(runtime.config, imageBase64, mime, 0.9);
+                const quickSim = quick && quick.similarity ? quick.similarity : 0;
+                if (quickSim < 0.9) {
+                  researchP = dshBridge.researchImage(runtime.config, {
+                    buffer: imgBuf,
+                    mime,
+                    description: text,
+                    hint: '画面特征：' + String(text || '').replace(/\s+/g, ' ').slice(0, 160) + '; 以图搜图候选（可能误配，待核）：' + (quick && quick.title ? String(quick.title) : '（无）'),
+                  }).catch(() => null);
+                }
+              } catch (_) { /* 探测失败就退回串行兜底 */ }
+            }
+            // 先做识图核对：以图搜图 → 候选 → 交叉核对画面特征，够了才下结论；
+            // 核对不了会明确告诉模型「别硬猜」，比让它自信报错作品名强。
+            try {
+              let extra = await imageSearch.identify(runtime.config, text, visionParams);
+              if (!extra) extra = await imageSearch.enrich(runtime.config, text, visionParams);
+              if (extra) {
+                search = { query: extra.query, hits: extra.hits, source: extra.source, confidence: extra.confidence };
+                if (extra.text) finalText = String(text || '') + extra.text;
+              }
+            } catch (err) {
+              runtime.logger && runtime.logger.warn('识图核对失败：' + String((err && err.message) || err));
+            }
+          }
+          // 疑难图兜底：识图链路自己都拿不准时，叫 DSH 再做一次「看图 + 受限联网核对」。
+          // 只有普通单图才走（长截图分段不兜底），最坏也就多 ~90 秒，且每次识图最多一次。
+          let dshResearch = null;
+          if (!promptText && imgBuf && search
+            && (search.source === 'none' || search.source === 'unverified' || search.confidence === 'low')) {
+            try {
+              const researchHint = '画面特征：' + String(text || '').replace(/\s+/g, ' ').slice(0, 160) + '; 以图搜图候选（可能误配）：' + ((search && search.query) ? String(search.query) : '（无）');
+              // 复核最多再等 30 秒：超过就先按现有结论回复，别把整条消息拖到 90 秒
+              const withCap = (p) => Promise.race([p, new Promise((r) => setTimeout(() => r(null), 55000))]);
+              dshResearch = researchP
+                ? await withCap(researchP)
+                : await withCap(dshBridge.researchImage(runtime.config, { buffer: imgBuf, mime, description: text, hint: researchHint }));
+              if (dshResearch && dshResearch.ok && dshResearch.conclusion) {
+                const lines = ['【DSH 复核（另一套链路：更强模型 + 联网，仅供参考）】'];
+                lines.push('结论：' + dshResearch.conclusion);
+                if (dshResearch.evidence) lines.push('依据：' + dshResearch.evidence);
+                if (dshResearch.confidence) lines.push('置信度：' + dshResearch.confidence);
+                const strong = dshResearch.confidence === '高' || dshResearch.confidence === '中';
+                if (search.source !== 'verified') {
+                  lines.push(strong
+                    ? '（这条来自独立链路、置信度' + (dshResearch.confidence || '中') + '，上面的以图搜图疑似结果可信度低 —— 优先采用这条复核结论；但仍要说「应该是」而不是绝对肯定。）'
+                    : '（这条来自独立链路；和上面的描述冲突时以你看到的画面为准，拿不准就说不太确定。）');
+                }
+                finalText = String(finalText || '') + '\n' + lines.join('\n');
+            // DSH 复核给出中/高置信、且否认了以图搜图的候选 → 把那段「疑似 xxx（很可能是认错）」删掉，
+            // 免得她一边看到正确结论、一边又照着疑似候选说错作品。
+            if (dshResearch && dshResearch.ok && (dshResearch.confidence === '高' || dshResearch.confidence === '中')) {
+              finalText = finalText
+                .split('\n')
+                .filter(function (ln) {
+                  const t = String(ln).trim();
+                  if (/^以图搜图说：/.test(t)) return false;
+                  if (/^（另外核对过：/.test(t)) return false;
+                  if (/^（说话时必须带/.test(t)) return false;
+                  return true;
+                })
+                .join('\n')
+                .replace(/【识图：疑似[^】]*】/g, '')
+                .replace(/\n{3,}/g, '\n\n');
+            }
+              }
+            } catch (err) {
+              runtime.logger && runtime.logger.warn('DSH 复核失败：' + String((err && err.message) || err));
+            }
+          }
+          return json(res, 200, {
+            ok: true,
+            text: finalText,
+            search,
+            dsh: {
+              describeMs: dshDesc && dshDesc.ms ? dshDesc.ms : null,
+              describeOk: !!(dshDesc && dshDesc.text),
+              researchMs: dshResearch && dshResearch.ms ? dshResearch.ms : null,
+              researchConfidence: dshResearch && dshResearch.confidence ? dshResearch.confidence : '',
+            },
           });
-          return json(res, 200, { ok: true, text });
         } catch (err) {
           runtime.logger.warn('图片识别失败：' + (err && err.message));
           return json(res, 500, { ok: false, error: String((err && err.message) || err) });

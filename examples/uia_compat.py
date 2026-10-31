@@ -58,6 +58,9 @@ import time
 log = logging.getLogger("wechatauto.uia_compat")
 
 _APPLIED = False
+
+# 2026-10-31: 由桥接在「发视频文件」时临时置 True，会话列表打不开就放弃，不再退搜索框。
+SKIP_SEARCH_FALLBACK = False
 _seen_logged = set()
 # 当前正在跑的 UIA 步骤（卡死时靠它看停在哪一步）。只有设了 WHALE_STEPLOG 才逐条记日志。
 _STEP = {"name": None, "since": 0.0}
@@ -592,6 +595,9 @@ def apply(verbose: bool = True) -> bool:
             log.warning("uia_compat: 点了 %r 但 current_chat=%r，回退搜索框", nm, cur)
         else:
             log.info("uia_compat: 会话列表里没有 %r，回退搜索框", target)
+        if SKIP_SEARCH_FALLBACK:
+            log.warning("uia_compat: 按要求跳过搜索框回退（会话列表打不开就放弃）")
+            return False
         return _fallback_open(self, target, index, section, retries)
 
     cls.open_chat = open_chat

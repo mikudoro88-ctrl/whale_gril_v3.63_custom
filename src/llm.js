@@ -108,6 +108,8 @@ class DeepSeekClient {
     // OpenCode Go 要求客户端自报身份 + 一个稳定的会话号（用于路由和 prompt 缓存）。
     // 同一进程内保持不变，等于「这一个对话」的 session。
     this.sessionId = 'whale-girl-' + crypto.randomBytes(12).toString('hex');
+    // 累计 token 用量（给「每条回复显示费用」用）
+    this.usage = { input: 0, output: 0, cacheHit: 0, cacheMiss: 0, calls: 0 };
     this.reload();
   }
 
@@ -129,6 +131,31 @@ class DeepSeekClient {
     this.maxTokens = ds.maxTokens || 700;
     this.timeoutMs = ds.timeoutMs || 45000;
     return this;
+  }
+
+  /** 记一笔 token 用量（OpenAI 格式的 usage 字段） */
+  _addUsage(u) {
+    if (!u || typeof u !== 'object') return;
+    const input = Number(u.prompt_tokens) || 0;
+    const output = Number(u.completion_tokens) || 0;
+    if (input) this.usage.input += input;
+    if (output) this.usage.output += output;
+    const hit = Number(u.prompt_cache_hit_tokens);
+    const miss = Number(u.prompt_cache_miss_tokens);
+    if (Number.isFinite(hit) && hit > 0) this.usage.cacheHit += hit;
+    if (Number.isFinite(miss) && miss > 0) this.usage.cacheMiss += miss;
+    this.usage.calls += 1;
+  }
+
+  /** 当前累计用量快照（浅拷贝，用来算单条消息的差值） */
+  usageSnapshot() {
+    return {
+      input: this.usage.input,
+      output: this.usage.output,
+      cacheHit: this.usage.cacheHit,
+      cacheMiss: this.usage.cacheMiss,
+      calls: this.usage.calls,
+    };
   }
 
   get isMock() {
@@ -182,7 +209,7 @@ class DeepSeekClient {
     };
   }
 
-  buildPayload({ system, turns = [], stream = false, maxTokens, safe = false }) {
+  buildPayload({ system, turns = [], stream = false, maxTokens, safe = false, noThink = false, relaxTokens = false, temperature = null }) {
     const messages = [];
     if (system) messages.push({ role: 'system', content: system });
     for (const t of turns) {
@@ -197,6 +224,9 @@ class DeepSeekClient {
       temperature: (() => {
         // safe = 刚才那条跑飞了，这次用更稳的参数再要一遍
         let t = safe ? Math.min(0.7, Number(this.temperature) || 0.7) : Math.max(0, Math.min(2, Number(this.temperature) || 0.95));
+        if (temperature != null && Number.isFinite(Number(temperature))) {
+          t = Math.max(0, Math.min(2, Number(temperature)));
+        }
         // 智谱 GLM 的 temperature 只接受 0~1
         if (this.provider === 'zhipu') t = Math.min(t, 0.99);
         return t;
@@ -204,11 +234,18 @@ class DeepSeekClient {
       max_tokens: (() => {
         const want = Number(maxTokens) || this.maxTokens;
         // 正常请求：调用方可以要更少，但不会超过配置上限
-        if (!safe) return Math.min(want, this.maxTokens);
+        // noThink 的短任务（提炼 JSON 之类）单独放宽：这类调用预算太小会直接空正文
+        if (!safe) return noThink || relaxTokens ? Math.min(want, 8000) : Math.min(want, this.maxTokens);
         // 跑飞重试：给足预算，别再因为 320 token 把话截断
         return Math.min(Math.max(want, 900), 2000);
       })(),
     };
+    // DeepSeek V4 系列（deepseek-flash = V4.1-Flash / deepseek-v4-pro）默认 effort=high：
+    // 先输出一大段 reasoning_content 才给正文，而鲸鲸只取正文，思考纯属白花 token 和延迟。
+    // 统一压到 low；deepseek-reasoner 例外，它本来就是靠思考吃饭的。
+    if (this.provider === 'deepseek' && !/reasoner/i.test(this.model)) payload.reasoning_effort = 'low';
+    // 调用方明确说「这次别思考」：看图认人/提炼查询词这类任务，思考只会把预算耗光
+    if (noThink && this.provider === 'deepseek') payload.thinking = { type: 'disabled' };
     // 惩罚项会逼模型避开常用词，是「乱说话」的元凶之一；跑飞重试时一律不带
     if (!safe && this.frequencyPenalty) payload.frequency_penalty = this.frequencyPenalty;
     if (!safe && this.presencePenalty) payload.presence_penalty = this.presencePenalty;
@@ -319,14 +356,14 @@ class DeepSeekClient {
   }
 
   /** 非流式，返回完整文本 */
-  async complete({ system, turns, maxTokens }) {
+  async complete({ system, turns, maxTokens, noThink = false, relaxTokens = false, temperature = null }) {
     let lastErr = null;
     let sawDegenerate = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       // 第一次用用户配的参数；发现跑飞或撞长度上限后，用更稳的参数再要一遍
       const safe = attempt > 0;
       try {
-        const payload = this.buildPayload({ system, turns, stream: false, maxTokens, safe });
+        const payload = this.buildPayload({ system, turns, stream: false, maxTokens, safe, noThink, relaxTokens, temperature });
         const { res } = await this._open(payload, { stream: false });
         if (res.statusCode !== 200) throw await this._errorFrom(res);
         const raw = await this._readAll(res);
@@ -336,6 +373,7 @@ class DeepSeekClient {
         } catch {
           throw new LlmError(FRIENDLY.empty, { code: 'bad_json', detail: 'invalid json: ' + raw.slice(0, 200) });
         }
+        this._addUsage(json && json.usage);
         const choice = (json && json.choices && json.choices[0]) || {};
         const text = String((choice.message && choice.message.content) || '').trim();
         if (!text) throw new LlmError(FRIENDLY.empty, { code: 'empty' });
@@ -389,7 +427,9 @@ class DeepSeekClient {
       const sample = await this.complete({
         system: '你是连接测试助手。',
         turns: [{ role: 'user', content: '只回复两个字：咕噜' }],
-        maxTokens: 32,
+        // 推理模型（deepseek-r1 等）会先写思考链，32 个 token 全花在思考上、正文为空，
+        // 于是「测试连接」误报失败。给足预算，让思考链之后还能吐出正文。
+        maxTokens: 512,
       });
       return { ...base, ok: true, ms: Date.now() - started, sample: String(sample).slice(0, 60) };
     } catch (err) {
@@ -406,6 +446,8 @@ class DeepSeekClient {
    */
   async *stream({ system, turns, signal }) {
     const payload = this.buildPayload({ system, turns, stream: true });
+    // 流式默认不回 usage，显式要一份（最后一个 chunk 里带）
+    payload.stream_options = { include_usage: true };
     const { req, res } = await this._open(payload, { signal, stream: true });
     if (res.statusCode !== 200) throw await this._errorFrom(res);
     res.setEncoding('utf8');
@@ -430,6 +472,7 @@ class DeepSeekClient {
           } catch {
             continue;
           }
+          if (json && json.usage) this._addUsage(json.usage);
           if (json?.error) {
             throw new LlmError(FRIENDLY.default, { code: 'stream_error', detail: String(json.error.message || '') });
           }

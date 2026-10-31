@@ -16,6 +16,8 @@ set "https_proxy="
 set "all_proxy="
 
 rem 连续失败计数：起来就退出超过 3 次就停下来，别每 3 秒重试刷屏
+rem auto-start whale server (127.0.0.1:8787) when the bridge starts
+call "%~dp0ensure-whale.bat"
 set "FAILS=0"
 
 :loop
