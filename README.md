@@ -16,7 +16,7 @@
 >
 > 详细改动、备份与回滚见 `docs/本仓库改动说明.md`。
 
-# 🐋 鲸鲸 · DeepSeek 鲸鱼娘聊天机器人
+# 🐋 鲸鲸 · DeepSeek 鲸鱼娘聊天机器人（魔改分支）
 
 > **想直接跑？点右边的 [Releases](https://github.com/Banan1cee/whale_gril/releases/latest)，下 `whale-girl-3.54.zip`（86 MB）。**
 > 里面已经带好 Node 22 和 Python 3.12，解压双击就能用，**不用装任何环境**。

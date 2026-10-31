@@ -1,8 +1,8 @@
 {
-    "name": "whale-girl-bot",
+    "name": "whale_gril_v3.63_custom",
     "version": "3.63",
     "private": false,
-    "description": "鲸鲸 —— 可接微信群 / B 站分享的 DeepSeek 鲸鱼娘聊天机器人",
+    "description": "鲸鲸 —— 基于 Banan1cee/whale_gril v3.63 的魔改分支：多来源识图核对、看图联网、B站视频回发、情绪与记忆分层、白名单权限、回复费用显示",
     "main": "server.js",
     "type": "commonjs",
     "scripts": {
@@ -26,10 +26,10 @@
         "llm"
     ],
     "license": "MIT",
-    "author": "Banan1cee (upstream) / fork maintainer",
+    "author": "Banan1cee (upstream) / mikudoro88-ctrl (fork)",
     "repository": {
         "type": "git",
-        "url": "https://github.com/<你的用户名>/whale-girl.git"
+        "url": "https://github.com/mikudoro88-ctrl/whale_gril_v3.63_custom.git"
     },
-    "homepage": "https://github.com/<你的用户名>/whale-girl"
+    "homepage": "https://github.com/mikudoro88-ctrl/whale_gril_v3.63_custom"
 }
