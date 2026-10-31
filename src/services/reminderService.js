@@ -68,24 +68,45 @@ class ReminderService {
   }
 
   load() {
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8').replace(/^\uFEFF/, '')) || {};
-      const list = Array.isArray(raw.items) ? raw.items : [];
-      this.items = list.filter((it) => it && it.id && Number(it.dueAt)).slice(-MAX_TOTAL);
-    } catch {
-      this.items = [];
+    let damaged = false;
+    for (const file of [this.file, this.file + '.bak']) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+        if (!raw || !Array.isArray(raw.items) || raw.items.some(it =>
+          !it || !it.id || !Number.isFinite(Number(it.dueAt)) || !Number(it.dueAt)
+          || (!ACTIVE.has(it.status) && !DONE.has(it.status)))) throw new Error('提醒文件格式不正确');
+        this.items = raw.items.slice(-MAX_TOTAL);
+        this.loadFailed = false;
+        if (file !== this.file && this.logger) this.logger.warn('提醒主文件不可用，已从 .bak 恢复');
+        return this;
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          damaged = true;
+          if (this.logger) this.logger.warn('提醒读取失败：' + file + '：' + err.message);
+        }
+      }
     }
+    // 两份都损坏时保留原件，不能用一次新建操作把可恢复的数据覆盖掉。
+    this.loadFailed = damaged;
+    this.items = [];
     return this;
   }
 
   save() {
-    if (!this.file) return false;
+    if (!this.file || this.loadFailed) return false;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       const body = JSON.stringify({ version: 1, savedAt: this.now(), items: this.items });
       const tmp = this.file + '.tmp';
       fs.writeFileSync(tmp, body, 'utf8');
       fs.renameSync(tmp, this.file);
+      // 镜像最新已提交状态，避免备份仍是 pending 而主文件已经 done。
+      try {
+        fs.writeFileSync(this.file + '.bak.tmp', body, 'utf8');
+        fs.renameSync(this.file + '.bak.tmp', this.file + '.bak');
+      } catch (err) {
+        if (this.logger) this.logger.warn('提醒备份写入失败：' + err.message);
+      }
       return true;
     } catch (err) {
       if (this.logger) this.logger.warn('提醒写入失败：' + err.message);
@@ -284,10 +305,15 @@ class ReminderService {
     for (const item of this.items) {
       if (item.status === 'pending') {
         const at = Number(item.dueAt);
-        if (at > now && (!next || at < next)) next = at;
+        const wakeAt = Math.max(now, at);
+        if (!next || wakeAt < next) next = wakeAt;
       } else if (item.status === 'retrying') {
         const at = Math.max(Number(item.dueAt), Number(item.retryAt) || 0);
-        if (at > now && (!next || at < next)) next = at;
+        const wakeAt = Math.max(now, at);
+        if (!next || wakeAt < next) next = wakeAt;
+      } else if (item.status === 'sending') {
+        const at = Math.max(now, Number(item.claimedAt || 0) + CLAIM_TIMEOUT_MS + 1);
+        if (!next || at < next) next = at;
       }
     }
     return next;
@@ -322,6 +348,7 @@ class ReminderService {
   cancel(id) {
     const item = this.items.find((it) => it.id === String(id || ''));
     if (!item) return { ok: false, error: '找不到这条提醒', statusCode: 404 };
+    if (item.status === 'sending') return { ok: false, error: '提醒正在发送，已无法保证撤回，请等待发送结果', statusCode: 409 };
     if (!ACTIVE.has(item.status)) return { ok: false, error: '这条提醒已经结束了', statusCode: 409 };
     const previous = JSON.parse(JSON.stringify(this.items));
     item.status = 'cancelled';

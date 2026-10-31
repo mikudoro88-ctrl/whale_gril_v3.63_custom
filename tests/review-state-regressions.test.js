@@ -21,7 +21,7 @@ function add(svc, clock, text = '开会') { return svc.add({ wxid: 'wx-test', te
 
 test('提醒回执不能复活取消任务，成功回执重复到达也不增加次数', t => {
   const { clock, make } = fixture(t); const svc = make();
-  const first = add(svc, clock); clock.ms += 2000; svc.due(); svc.cancel(first.id);
+  const first = add(svc, clock); svc.cancel(first.id); clock.ms += 2000;
   assert.equal(svc.ack(first.id, { ok: true }).statusCode, 409);
   assert.equal(make().list()[0].status, 'cancelled');
   const second = add(svc, clock); clock.ms += 2000; svc.due();
@@ -56,8 +56,11 @@ test('提醒保存失败必须报错，不能返回未落盘任务或留下虚�
   svc.save = save; svc.due(); svc.save = () => false;
   assert.throws(() => svc.ack(item.id, { ok: true }), /保存失败/);
   assert.equal(svc.list()[0].status, 'sending');
-  assert.throws(() => svc.cancel(item.id), /保存失败/);
+  assert.equal(svc.cancel(item.id).statusCode, 409);
   assert.equal(svc.list()[0].status, 'sending');
+  svc.save = save; const pending = add(svc, clock); svc.save = () => false;
+  assert.throws(() => svc.cancel(pending.id), /保存失败/);
+  assert.equal(svc.list()[0].status, 'pending');
 });
 
 test('没有回执的提醒最多重试一次，重启后超时任务不补发', t => {

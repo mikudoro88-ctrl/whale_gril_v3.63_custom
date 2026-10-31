@@ -50,6 +50,7 @@ import time
 _EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
 if _EXAMPLES_DIR not in sys.path:
     sys.path.insert(0, _EXAMPLES_DIR)
+from reminder_watch import start_reminder_watch
 from sticker_transport import (guarded_send as guarded_sticker_send, read_enabled_config,
                                resolve_target as resolve_sticker_target, result as sticker_result,
                                WindowsDesktop, quarantined_input_value,
@@ -3917,7 +3918,10 @@ def main():
     threading.Thread(target=bridge_heartbeat, daemon=True).start()
     threading.Thread(target=listener_watch, daemon=True).start()
     threading.Thread(target=contacts_sync_once, daemon=True).start()
-    start_reminder_watch()
+    global REMINDER_RUNNER
+    REMINDER_RUNNER = start_reminder_watch(
+        http=LOCAL_HTTP, base=bot_url.rsplit("/webhook", 1)[0], token=token,
+        send_text=send_text, send_at=send_at, log=log)
     log("已启动。鲸鲸地址：", bot_url)
 
     # 就绪标记：外部（守护脚本 / 自检）据此判断「进程在，但可能卡在初始化」
