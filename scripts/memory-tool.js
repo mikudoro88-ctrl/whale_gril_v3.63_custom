@@ -12,7 +12,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
-const backup = require('../src/memory/backup');
+const backup = require('../src/memoryBackup');
 
 const root = path.resolve(__dirname, '..');
 const [cmd = 'info', arg = '', ...rest] = process.argv.slice(2);
@@ -33,7 +33,7 @@ async function main() {
     }
     console.log('已有快照（新 → 旧）：');
     for (const it of items) {
-      console.log(`  ${it.name}  ${fmtTime(it.mtime)}  ${it.sessions} 个聊天 / ${it.messages} 条消息 / ${it.notes} 条偏好`);
+      console.log(`  ${it.name}  ${fmtTime(it.mtime)}  ${it.sessions} 个会话 / ${it.messages} 条消息 / ${it.notes} 条笔记`);
     }
     return 0;
   }
@@ -41,8 +41,8 @@ async function main() {
   if (cmd === 'info') {
     const b = backup.collect(root);
     const s = backup.summarize(b);
-    console.log(`当前记忆：${s.sessions} 个聊天 / ${s.messages} 条消息 / ${s.notes} 条偏好`);
-    console.log(`数据目录：${path.join(root, 'data', 'memory')}`);
+    console.log(`当前记忆：${s.sessions} 个会话 / ${s.messages} 条消息 / ${s.notes} 条笔记`);
+    console.log(`数据目录：${path.join(root, 'data')}`);
     return 0;
   }
 
@@ -69,7 +69,7 @@ async function main() {
     const dest = path.isAbsolute(target) ? target : path.resolve(process.cwd(), target);
     const info = backup.exportTo(root, dest, { withSecrets });
     console.log(`已导出：${info.file}`);
-    console.log(`内容：${info.sessions} 个聊天 / ${info.messages} 条消息 / ${info.notes} 条偏好`);
+    console.log(`内容：${info.sessions} 个会话 / ${info.messages} 条消息 / ${info.notes} 条笔记`);
     console.log(withSecrets ? '（这次连 Key 一起导出了，别发给别人）' : '（已自动去掉 API Key，可以放心发人；要连 Key 一起带走加 --secrets）');
     console.log('换电脑或重装后，用 restore 把这个文件放回去就行。');
     return 0;
@@ -78,17 +78,14 @@ async function main() {
   if (cmd === 'restore') {
     // 服务在跑，直接改文件的话，内存里的旧记忆会在下次写盘时把文件盖回去
     const serverUp = await new Promise((resolve) => {
-      let port = 8787;
-      try { const saved = Number(fs.readFileSync(path.join(root, 'data', 'server-port.txt'), 'utf8')); if (Number.isInteger(saved) && saved > 0 && saved < 65536) port = saved; } catch {}
-      const probe = net.connect({ host: '127.0.0.1', port });
+      const probe = net.connect({ host: '127.0.0.1', port: 8787 });
       probe.setTimeout(600, () => { probe.destroy(); resolve(false); });
       probe.once('connect', () => { probe.destroy(); resolve(true); });
       probe.once('error', () => resolve(false));
     });
     if (serverUp) {
       console.log('提示：服务在跑，直接改文件的话，内存里的旧记忆可能把文件盖回去。');
-      console.log('      请先停止服务再恢复；记忆 v2 不提供网页或启动器正文恢复入口。');
-      return 1;
+      console.log('      建议用网页接口 /api/memory/restore（恢复后自动生效），或恢复完重启一次。');
     }
     if (!arg) {
       console.error('用法：node scripts/memory-tool.js restore <备份文件>');
@@ -101,7 +98,7 @@ async function main() {
     }
     const info = backup.restoreFromFile(root, file);
     console.log('已恢复：' + info.restored.join('、'));
-    console.log(`现在有 ${info.sessions} 个聊天 / ${info.messages} 条消息 / ${info.notes} 条偏好`);
+    console.log(`现在有 ${info.sessions} 个会话 / ${info.messages} 条消息 / ${info.notes} 条笔记`);
     console.log('恢复前的旧记忆已另存到 data\\backups\\，后悔了可以再 restore 回去。');
     console.log('如果服务正在运行，重启一下（或双击「重启鲸鱼娘.bat」）才生效。');
     return 0;

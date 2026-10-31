@@ -132,7 +132,7 @@ const DEFAULT_CONFIG = {
     // 主人骂她时能不能还嘴（默认关：只许委屈不许骂回去）
     masterRoast: false,
   },
-  chat: { privateMaxChars: 100, groupMaxChars: 70, historyTurns: 120, groupHistoryTurns: 100, maxBubbles: 2, discussionMaxChars: 400, emojiChance: 0 },
+  chat: { privateMaxChars: 140, groupMaxChars: 70, historyTurns: 200, groupHistoryTurns: 150, maxBubbles: 2, discussionMaxChars: 600, emojiChance: 0 },
   // 联网：问天气/新闻这类实时问题时现搜。city 用来把「今天天气怎么样」补成「上海 天气」，
   // 搜到的结果准得多；留空就按对方原话搜（也能用，但经常搜到别的城市）。
   websearch: { enabled: true, city: '', timeoutMs: 8000 },
@@ -205,8 +205,7 @@ const DEFAULT_CONFIG = {
     maxRepliesPerHour: 1000,
     muteDefaultMinutes: 30,
   },
-  // 记忆参数已移到 src/memory/constants.js（写死，不提供 UI/接口）；
-  // config.json 里旧的 memory.* 会被忽略，不再参与运行时。
+  memory: { maxSessions: 200, maxMessages: 400, maxNotesPerUser: 6, digestEvery: 12, digest: true, semantic: true, semanticMinCandidates: 3 },
   // 微信桥接：account = 固定用哪个微信号（微信双开时必填）。网页「设置 → 微信账号」会直接写这里，
   // 一般不用手改；留空 = 按「最近活跃」自动选（双开时可能选到大号）。
   wechat: {
@@ -414,24 +413,17 @@ function saveSettings(cfg, patch) {
   // patch 里显式带的 keys 也要合进来，否则一次 saveSettings 就把别的服务商的 Key 丢了，
   // 切换备用服务商时找不到能用的 Key
   const keys = { ...(current.keys || {}) };
-  const previousProvider = String(current.provider || cfg.provider || (cfg.deepseek || {}).provider || 'deepseek');
-  const previousKey = Object.prototype.hasOwnProperty.call(current, 'apiKey') ? current.apiKey :
-    (cfg.llm || {}).apiKey || (previousProvider === 'deepseek' ? (cfg.deepseek || {}).apiKey || (cfg.env || {}).DEEPSEEK_API_KEY : '') || '';
-  if (previousKey && !keys[previousProvider]) keys[previousProvider] = previousKey;
   for (const [name, value] of Object.entries((patch && patch.keys) || {})) {
     if (name && value) keys[name] = String(value).trim();
   }
-  const providerName = String(next.provider || previousProvider).trim();
-  if (patch && Object.prototype.hasOwnProperty.call(patch, 'apiKey')) {
-    next.apiKey = String(patch.apiKey || '').trim();
-    if (providerName) {
-      if (next.apiKey) keys[providerName] = next.apiKey;
-      else delete keys[providerName];
-    }
-  } else if (providerName && providerName !== previousProvider) {
+  const providerName = String(next.provider || current.provider || '').trim();
+  if (patch && patch.apiKey) {
+    next.apiKey = String(patch.apiKey).trim();
+    if (providerName) keys[providerName] = next.apiKey;
+  } else if (providerName && providerName !== String(current.provider || '').trim()) {
     next.apiKey = keys[providerName] || '';
   }
-  next.keys = keys;
+  if (Object.keys(keys).length) next.keys = keys;
   fs.mkdirSync(cfg.paths.dataDir, { recursive: true });
   fs.writeFileSync(cfg.paths.settingsFile, JSON.stringify(next, null, 2), 'utf8');
   return next;
@@ -447,13 +439,7 @@ function resolveRuntime(cfg) {
   const provider = String(settings.provider || cfg.provider || legacy.provider || 'deepseek');
   const preset = PROVIDERS[provider] || PROVIDERS.custom;
   const envKey = (cfg.env && cfg.env.DEEPSEEK_API_KEY) || '';
-  // 显式清空不能回退到另一服务的配置密钥。
-  const configuredProvider = String(cfg.provider || legacy.provider || 'deepseek');
-  const apiKey = String(Object.prototype.hasOwnProperty.call(settings, 'apiKey')
-    ? settings.apiKey
-    : (settings.keys && settings.keys[provider]) ||
-      (provider === configuredProvider ? llmCfg.apiKey : '') ||
-      (provider === 'deepseek' ? legacy.apiKey || envKey : '') || '').trim();
+  const apiKey = (settings.apiKey || llmCfg.apiKey || legacy.apiKey || envKey || '').trim();
   // 只有 provider 确实是 deepseek 时，才沿用 deepseek 段里的地址/模型
   const legacyRelevant = provider === 'deepseek';
   const baseUrl = String(

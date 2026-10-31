@@ -13,8 +13,7 @@ const { json, readBody, sanitizeId } = require('../util');
 function bridgeOnly(runtime, req, res) {
   const gw = runtime.gateways && runtime.gateways.get && runtime.gateways.get('wechat');
   if (!gw || !gw.verifyToken(req, null)) {
-    json(res, 404, { ok: false, error: '网页聊天已下线，请用启动器' });
-    return true;
+    return json(res, 404, { ok: false, error: '网页聊天已下线，请用启动器' });
   }
   return null;
 }

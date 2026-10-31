@@ -25,8 +25,6 @@ namespace WhaleLauncher
     public sealed class Snapshot
     {
         public bool NodeUp;
-        public bool NodeReady;
-        public bool NeedsKey;
         public bool BridgeUp;
         public int Port = 8787;
         public long UptimeSec;
@@ -63,12 +61,6 @@ namespace WhaleLauncher
         public string LogPath { get; }
         public event Action<LogLine> Line;
 
-        private readonly object _processLock = new object();
-        private bool _bridgeWanted;
-        private bool _disposed;
-        private int _restartGeneration;
-        private int _restartCount;
-        private DateTime _bridgeStartedAt;
         private Process _node;
         private Process _bridge;
         private readonly HttpClient _http = new HttpClient(new HttpClientHandler { UseProxy = false })
@@ -217,81 +209,32 @@ namespace WhaleLauncher
             if (NodeRunning) return;
             var exe = Path.Combine(BaseDir, "runtime", "node.exe");
             if (!File.Exists(exe)) exe = "node";
-            _node = Launch(exe, "server.js --no-browser", "K", "内核");
-        }
-
-        public async Task<bool> WaitForNodeAsync()
-        {
-            for (var attempt = 0; attempt < 40; attempt++)
-            {
-                if (!NodeRunning) return false;
-                try
-                {
-                    using var response = await _http.GetAsync(Url + "/healthz");
-                    using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-                    if (response.IsSuccessStatusCode && Str(body.RootElement, "service") == "whale-girl"
-                        && Bool(body.RootElement, "up") && Long(body.RootElement, "pid") == _node.Id) return true;
-                }
-                catch { }
-                await Task.Delay(250);
-            }
-            Say("内核尚未就绪，请查看诊断日志");
-            return false;
+            _node = Launch(exe, "server.js", "K", "内核");
         }
 
         public void StartBridge()
         {
-            lock (_processLock)
+            if (BridgeRunning) return;
+            var exe = Path.Combine(BaseDir, "runtime", "python", "python.exe");
+            if (!File.Exists(exe))
             {
-                if (_disposed || BridgeRunning) return;
-                if (!NodeRunning) { Say("内核尚未启动，请先启动服务"); return; }
-                var exe = Path.Combine(BaseDir, "runtime", "python", "python.exe");
-                if (!File.Exists(exe)) { Say("找不到内置 Python，桥接起不来，请检查安装包"); return; }
-                try { File.Delete(Path.Combine(DataDir, "bridge-ready.json")); } catch { }
-                try { File.Delete(Path.Combine(DataDir, "PAUSED")); } catch { }
-                _bridgeWanted = true;
-                _bridgeStartedAt = DateTime.UtcNow;
-                _bridge = Launch(exe, "-u examples\\wechatauto_bridge.py", "B", "桥接");
+                Say("找不到 runtime\\python\\python.exe，桥接起不来");
+                return;
             }
+            _bridge = Launch(exe, "-u examples\\wechatauto_bridge.py", "B", "桥接");
         }
 
-        private async Task RecoverBridgeAsync(Process exited, int generation)
-        {
-            int code;
-            try { code = exited.ExitCode; } catch { return; }
-            // 缺依赖、账号/数据库配置错误不反复重启；崩溃和配置切换才恢复。
-            if (code == 0 || code == 1 || code == 2) return;
-            await Task.Delay(3000);
-            lock (_processLock)
-            {
-                if (_disposed || !_bridgeWanted || generation != _restartGeneration
-                    || !ReferenceEquals(_bridge, exited) || !NodeRunning
-                    || File.Exists(Path.Combine(DataDir, "PAUSED"))) return;
-                if ((DateTime.UtcNow - _bridgeStartedAt).TotalSeconds >= 60) _restartCount = 0;
-                if (++_restartCount > 3) { _bridgeWanted = false; Say("桥接连续异常退出，已停止自动重启，请查看诊断"); return; }
-                Say(code == 7 ? "桥接请求重新连接，正在重启…" : "桥接异常退出，正在自动恢复…");
-                _bridge = null;
-                StartBridge();
-            }
-        }
-
-        public async Task StartAllAsync()
+        public void StartAll()
         {
             StartNode();
-            if (await WaitForNodeAsync()) StartBridge();
+            StartBridge();
         }
 
         public void RestartBridge()
         {
-            lock (_processLock)
-            {
-                _bridgeWanted = false;
-                _restartGeneration++;
-                _restartCount = 0;
-                Kill(_bridge, "B", "桥接");
-                _bridge = null;
-                StartBridge();
-            }
+            Kill(_bridge, "B", "桥接");
+            _bridge = null;
+            StartBridge();
         }
 
         private Process Launch(string exe, string args, string src, string what)
@@ -303,7 +246,6 @@ namespace WhaleLauncher
                     WorkingDirectory = BaseDir,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                    RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     StandardOutputEncoding = Encoding.UTF8,
@@ -315,16 +257,11 @@ namespace WhaleLauncher
                 psi.Environment["PYTHONIOENCODING"] = "utf-8";
                 psi.Environment["PYTHONUNBUFFERED"] = "1";
                 psi.Environment["PYTHONUTF8"] = "1";
-                if (src == "K") psi.Environment["WHALE_CONTROL_STDIN"] = "1";
 
                 var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
                 p.OutputDataReceived += (_, e) => { if (e.Data != null) Emit(src, e.Data); };
                 p.ErrorDataReceived += (_, e) => { if (e.Data != null) Emit(src, e.Data); };
-                p.Exited += (_, __) =>
-                {
-                    Emit(src, $"{what}已退出（code={TryExitCode(p)}）");
-                    if (src == "B") _ = RecoverBridgeAsync(p, _restartGeneration);
-                };
+                p.Exited += (_, __) => Emit(src, $"{what}已退出（code={TryExitCode(p)}）");
                 p.Start();
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
@@ -345,16 +282,10 @@ namespace WhaleLauncher
 
         public void StopAll()
         {
-            lock (_processLock)
-            {
-                _bridgeWanted = false;
-                _restartGeneration++;
-                _restartCount = 0;
-                Kill(_bridge, "B", "桥接");
-                Kill(_node, "K", "内核");
-                _bridge = null;
-                _node = null;
-            }
+            Kill(_bridge, "B", "桥接");
+            Kill(_node, "K", "内核");
+            _bridge = null;
+            _node = null;
         }
 
         private void Kill(Process p, string src, string what)
@@ -364,21 +295,6 @@ namespace WhaleLauncher
             {
                 if (!p.HasExited)
                 {
-                    // 内核先落盘退出；只有超时才强制结束。
-                    if (src == "K")
-                    {
-                        try
-                        {
-                            p.StandardInput.WriteLine("shutdown");
-                            p.StandardInput.Flush();
-                            if (p.WaitForExit(5000))
-                            {
-                                Emit(src, $"已正常停止{what}");
-                                return;
-                            }
-                        }
-                        catch { /* 管道断开时回退到强制结束 */ }
-                    }
                     p.Kill(entireProcessTree: true);
                     p.WaitForExit(3000);
                     Emit(src, $"已停止{what}");
@@ -402,8 +318,6 @@ namespace WhaleLauncher
                     var json = await _http.GetStringAsync(Url + "/api/status");
                     using var doc = JsonDocument.Parse(json);
                     var root = doc.RootElement;
-                    s.NodeReady = Bool(root, "ok");
-                    s.NeedsKey = Bool(root, "needsKey");
                     s.UptimeSec = Long(root, "uptimeSec");
                     s.Provider = Str(root, "providerLabel");
                     if (string.IsNullOrEmpty(s.Provider)) s.Provider = Str(root, "provider");
@@ -413,8 +327,7 @@ namespace WhaleLauncher
 
                     if (root.TryGetProperty("gateways", out var gws) && gws.ValueKind == JsonValueKind.Array && gws.GetArrayLength() > 0)
                     {
-                        var gw = gws.EnumerateArray().FirstOrDefault(g => Str(g, "platform") == "wechat");
-                        if (gw.ValueKind != JsonValueKind.Object) return s;
+                        var gw = gws[0];
                         if (gw.TryGetProperty("stats", out var st) && st.ValueKind == JsonValueKind.Object)
                         {
                             s.StReceived = (int)Long(st, "received");
@@ -441,7 +354,7 @@ namespace WhaleLauncher
                         s.BridgeUp = s.BridgeUp || s.BrOnline;
                     }
                 }
-                catch { s.StLastError = "内核进程在运行，但状态接口尚未就绪，请查看诊断"; }
+                catch { /* 内核刚起还没监听 */ }
             }
 
             return s;
@@ -509,9 +422,8 @@ namespace WhaleLauncher
 
         public void Dispose()
         {
-            _disposed = true;
-            StopAll();
             _http.Dispose();
+            StopAll();
         }
     }
 }

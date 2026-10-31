@@ -313,20 +313,6 @@ test('普通聊天不会被提醒分支吃掉', async (t) => {
   assert.equal(bot.reminders.list().length, 0);
 });
 
-test('聊天取消提醒按实际取消数回复，并说明正在发送的任务', async t => {
-  const { config } = fixture(t);
-  const { bot } = makeBot(t, config);
-  bot.reminders.add({ wxid: 'wxid_a', text: '正在发', at: NOW.getTime() + 1000 });
-  bot.reminders.add({ wxid: 'wxid_a', text: '稍后发', at: NOW.getTime() + 10000 });
-  bot.reminders.due(NOW.getTime() + 2000);
-  const result = await bot.decide({ platform: 'wechat', chatId: 'wxid_a', chatType: 'private',
-    senderId: 'u1', senderName: '阿螈', text: '取消提醒' });
-  assert.match(result.canned, /取消了 1 条/);
-  assert.match(result.canned, /另有 1 条正在发送/);
-  assert.equal(bot.reminders.list().find(it => it.text === '正在发').status, 'sending');
-  assert.equal(bot.reminders.list().find(it => it.text === '稍后发').status, 'cancelled');
-});
-
 /* ---------------- HTTP ---------------- */
 
 test('HTTP：列表 / 取消 / 桥接领取要 token', async (t) => {
