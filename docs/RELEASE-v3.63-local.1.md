@@ -81,3 +81,11 @@
 - 原项目：**MIT**，版权归 [Banan1cee](https://github.com/Banan1cee/whale_gril) 所有
 - 本分支同样以 MIT 发布，保留原 LICENSE；改动部分由 `mikudoro88-ctrl` 维护
 - 请勿把本分支当作原创作品再发布；二次分发请保留 LICENSE 与署名
+
+## 附：发行包校验
+
+- 文件：`whale-girl-3.63-custom-full.zip`
+- 大小：125,951,715 字节（120.1 MB）
+- SHA256：`7DC1A2F76D584749D95214A7FD1A81AF8DB57A7D2D77EA95988DB411CD79FF64`
+
+下载后可校验：`Get-FileHash .\whale-girl-3.63-custom-full.zip -Algorithm SHA256`
