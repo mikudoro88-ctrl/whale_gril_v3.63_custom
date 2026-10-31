@@ -10,6 +10,7 @@ namespace WhaleLauncher
     public sealed class ApiResult
     {
         public bool Ok;
+        public int StatusCode;
         public string Error = "";
         public string Raw = "";
         public JsonElement Root;
@@ -45,7 +46,7 @@ namespace WhaleLauncher
         private static async Task<ApiResult> Wrap(HttpResponseMessage res)
         {
             var text = await res.Content.ReadAsStringAsync();
-            var outRes = new ApiResult { Ok = res.IsSuccessStatusCode, Raw = text };
+            var outRes = new ApiResult { Ok = res.IsSuccessStatusCode, StatusCode = (int)res.StatusCode, Raw = text };
             try
             {
                 using var doc = JsonDocument.Parse(text);
@@ -66,7 +67,8 @@ namespace WhaleLauncher
         {
             try
             {
-                return await Wrap(await Http.GetAsync(baseUrl + path));
+                using var response = await Http.GetAsync(baseUrl + path);
+                return await Wrap(response);
             }
             catch (Exception ex)
             {
@@ -78,8 +80,9 @@ namespace WhaleLauncher
         {
             try
             {
-                var body = new StringContent(json, Encoding.UTF8, "application/json");
-                return await Wrap(await Http.PostAsync(baseUrl + path, body));
+                using var body = new StringContent(json, Encoding.UTF8, "application/json");
+                using var response = await Http.PostAsync(baseUrl + path, body);
+                return await Wrap(response);
             }
             catch (Exception ex)
             {
@@ -90,7 +93,8 @@ namespace WhaleLauncher
         public static string Esc(string s)
         {
             if (s == null) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "");
+            var json = JsonSerializer.Serialize(s);
+            return json.Substring(1, json.Length - 2);
         }
     }
 }

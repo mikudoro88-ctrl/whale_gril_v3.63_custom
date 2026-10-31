@@ -163,6 +163,10 @@ namespace WhaleLauncher.Views
                 new FieldSpec { Path = "vision.baseUrl", Label = "看图接口地址", Kind = "text" },
                 new FieldSpec { Path = "vision.model", Label = "看图模型名", Kind = "text", Hint = "默认 glm-4v-flash（免费）" },
                 new FieldSpec { Path = "vision.timeoutMs", Label = "看图超时(毫秒)", Kind = "num", Min = 1000, Max = 300000 },
+                new FieldSpec { Path = "voice.enabled", Label = "启用语音识别", Kind = "bool" },
+                new FieldSpec { Path = "voice.apiKey", Label = "语音 API Key", Kind = "secret", Hint = "默认使用阿里云百炼的 Key，与聊天或看图 Key 分开" },
+                new FieldSpec { Path = "voice.baseUrl", Label = "语音接口地址", Kind = "text" },
+                new FieldSpec { Path = "voice.model", Label = "语音模型", Kind = "text" },
                 new FieldSpec { Path = "voice.timeoutMs", Label = "语音识别超时(毫秒)", Kind = "num", Min = 1000, Max = 300000 },
                 new FieldSpec { Path = "voice.maxSeconds", Label = "超过多少秒的语音不转", Kind = "num", Min = 1, Max = 600 },
             }},
@@ -681,9 +685,7 @@ namespace WhaleLauncher.Views
                     pwd.LostFocus += async (s, e) =>
                     {
                         if (_loading || pwd.Password.Length == 0) return;
-                        await PatchAsync(f.Path, "\"" + Api.Esc(pwd.Password.Trim()) + "\"");
-                        pwd.Password = "";
-                        StatusText.Text = f.Label + " 已保存。";
+                        if (await PatchAsync(f.Path, "\"" + Api.Esc(pwd.Password.Trim()) + "\"")) pwd.Password = "";
                     };
                     return Row(f.Label, pwd, f.Hint);
                 }
@@ -752,13 +754,14 @@ namespace WhaleLauncher.Views
             }
         }
 
-        private async Task PatchAsync(string path, string jsonLiteral)
+        private async Task<bool> PatchAsync(string path, string jsonLiteral)
         {
             var body = "{\"patch\":{\"" + Api.Esc(path) + "\":" + jsonLiteral + "}}";
             var res = await Api.Post(_sup.Url, "/api/config", body);
             StatusText.Text = res.Ok
                 ? path + " 已保存 " + DateTime.Now.ToString("HH:mm:ss")
                 : path + " 保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+            return res.Ok;
         }
 
         // ── 模型 / 看图 / 关于 ───────────────────────────────────
@@ -806,27 +809,30 @@ namespace WhaleLauncher.Views
             body.Children.Add(buttons);
             body.Children.Add(result);
 
-            save.Click += async (s, e) =>
+            string ModelRequest()
             {
                 var prov = (cmb.SelectedItem as ProviderItem)?.Key ?? "";
-                var json = "{"
+                return "{"
                     + "\"provider\":\"" + Api.Esc(prov) + "\","
                     + "\"baseUrl\":\"" + Api.Esc(baseUrl.Text.Trim()) + "\","
                     + "\"model\":\"" + Api.Esc(model.Text.Trim()) + "\","
                     + "\"mock\":" + (mock.IsChecked == true ? "true" : "false")
                     + (key.Password.Length > 0 ? ",\"apiKey\":\"" + Api.Esc(key.Password.Trim()) + "\"" : "")
-                    + "}";
+                    + ",\"userName\":\"" + Api.Esc(owner.Text.Trim()) + "\"}";
+            }
+
+            save.Click += async (s, e) =>
+            {
+                var json = ModelRequest();
                 var res = await Api.Post(_sup.Url, "/api/settings", json);
                 if (!res.Ok) { result.Text = "保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw); return; }
-                if (owner.Text.Trim().Length > 0)
-                    await Api.Post(_sup.Url, "/api/settings", "{\"userName\":\"" + Api.Esc(owner.Text.Trim()) + "\"}");
                 key.Password = "";
                 result.Text = "已保存。";
             };
             test.Click += async (s, e) =>
             {
                 result.Text = "正在测…";
-                var res = await Api.Post(_sup.Url, "/api/settings/test", "{}");
+                var res = await Api.Post(_sup.Url, "/api/settings/test", ModelRequest());
                 result.Text = res.Ok ? "连通正常。" : "测试没通过：" + (res.Error.Length > 0 ? res.Error : res.Raw);
             };
 

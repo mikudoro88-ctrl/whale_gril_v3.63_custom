@@ -666,7 +666,7 @@ MAX_REPLIES_PER_MIN = 8
 BRIDGE_LOCK_PORT = 47821
 
 # —— 语音识别（语音消息 → 文字）——
-# 默认用阿里云百炼的 qwen3-asr-flash；Key 依次取 voice.apiKey → data/settings.json → deepseek.apiKey
+# 默认用阿里云百炼的 qwen3-asr-flash；只使用语音专用或目标服务商的 Key。
 VOICE_ENABLED = True
 VOICE_BASE_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 VOICE_MODEL = "qwen3-asr-flash"
@@ -677,35 +677,38 @@ VOICE_SAMPLE_RATE = 16000
 
 
 def _resolve_voice_key(cfg):
-    """语音 Key 的查找链：voice.apiKey → settings.voiceApiKey → settings.apiKey → config.deepseek.apiKey。
-
-    以前只回退到 settings.apiKey，配置文件里写的 deepseek.apiKey 永远用不上（注释承诺了却没实现）；
-    而且 reload_config 不刷新语音 Key，网页里换 Key 必须重启桥接才生效。
-    """
+    """优先语音专用 Key；通用 Key 仅允许发往同一服务商的地址。"""
+    from urllib.parse import urlsplit
     vo = (cfg.get("voice") or {}) if isinstance(cfg, dict) else {}
     key = str(vo.get("apiKey") or "").strip()
     if key:
         return key
+    def origin(value):
+        try:
+            u = urlsplit(str(value or ""))
+            return (u.scheme.lower(), (u.hostname or "").lower(), u.port or (443 if u.scheme == "https" else 80))
+        except Exception:
+            return None
+    destination = origin(vo.get("baseUrl") or VOICE_BASE_URL)
+    host = destination[1] if destination else ""
     try:
         with open(os.path.join(ROOT, "data", "settings.json"), "r", encoding="utf-8-sig") as sf:
             st = json.load(sf)
-        for name in ("voiceApiKey", "apiKey"):
-            v = str(st.get(name) or "").strip()
-            if v:
-                return v
         keys = st.get("keys") or {}
-        for name in ("vision", "qwen", "zhipu", "deepseek"):
-            v = str(keys.get(name) or "").strip()
-            if v:
-                return v
+        dedicated = str(st.get("voiceApiKey") or keys.get("voice") or "").strip()
+        if dedicated:
+            return dedicated
+        if host in {"dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"}:
+            matching = str(keys.get("qwen") or (st.get("apiKey") if st.get("provider") == "qwen" else "") or "").strip()
+            if matching:
+                return matching
+        if destination and destination == origin(st.get("baseUrl")):
+            return str(st.get("apiKey") or "").strip()
     except Exception:
         pass
-    try:
-        v = str(((cfg.get("deepseek") or {}).get("apiKey") or "")).strip()
-        if v:
-            return v
-    except Exception:
-        pass
+    legacy = cfg.get("deepseek") or {}
+    if destination and destination == origin(legacy.get("baseUrl") or "https://api.deepseek.com"):
+        return str(legacy.get("apiKey") or "").strip()
     return ""
 
 
@@ -904,7 +907,9 @@ def wait_for_server(url, timeout=30):
     while _t.time() < deadline:
         try:
             r = LOCAL_HTTP.get(health, timeout=3)
-            if r.status_code < 500:
+            body = r.json() if r.status_code == 200 else None
+            if (isinstance(body, dict) and body.get("ok") is True
+                    and body.get("up") is True and body.get("service") == "whale-girl"):
                 if waited > 0:
                     log("服务已就绪（等了 %d 秒）" % waited)
                 return True
@@ -1094,7 +1099,7 @@ def main():
             try:
                 import importlib.util as _ilu
                 _spec = _ilu.spec_from_file_location(
-                    "uia_compat", os.path.join(_here, "uia_compat.py"))
+                    "uia_compat", os.path.join(ROOT, "examples", "uia_compat.py"))
                 _mod = _ilu.module_from_spec(_spec)
                 sys.modules["uia_compat"] = _mod
                 _spec.loader.exec_module(_mod)
@@ -2568,8 +2573,8 @@ def main():
         if not generation or sticker_config_now() is None:
             return False
         try:
-            response = LOCAL_HTTP.get(sticker_base + "/api/stickers/status",
-                                      headers=sticker_headers, timeout=3)
+            response = LOCAL_HTTP.get(sticker_base + "/api/stickers/gate",
+                                      params={"id": job_id}, headers=sticker_headers, timeout=3)
             status = response.json() if response.status_code == 200 else None
             return bool(isinstance(status, dict) and status.get("ok") is True
                         and status.get("enabled") is True
@@ -3024,6 +3029,7 @@ def main():
                         buf = _io.BytesIO()
                         seg.save(buf, format="JPEG", quality=88)
                         parts.append(buf.getvalue())
+                    mime = "image/jpeg"
                     log("长截图 %dx%d，切成 %d 段分别识别" % (w, h, len(parts)))
                 else:
                     # 普通图：统一转 RGB JPEG 再发，规避 webp/heic 之类的格式坑
@@ -3065,6 +3071,9 @@ def main():
         """语音消息 → 文字；失败返回空串。"""
         if not VOICE_ENABLED:
             log("语音识别已关闭（voice.enabled=false）")
+            return ""
+        if not VOICE_API_KEY:
+            log_throttled("voice-key-missing", "语音识别未配置对应服务商的 Key，请在启动器「看图与语音」中填写语音 Key")
             return ""
         try:
             import io
@@ -3115,6 +3124,9 @@ def main():
             username = msg.get("username") or ""
             if not username:
                 return
+            sender = msg.get("sender_username") or ""
+            if sender == me:
+                return  # 自己发的
             mtype = msg.get("type") or ""
             content = (msg.get("content") or "").strip()
             # 有的微信版本把表情包报成「图片」，正文里还是 <emoji md5=...>：
@@ -3168,13 +3180,6 @@ def main():
                     content = _GROUP_SENDER_PREFIX_RE.sub("", content, count=1).strip()
             if not content or content.startswith("<"):
                 return
-            sender = msg.get("sender_username") or ""
-            if sender == me:
-                return  # 自己发的
-            # 「这条是不是放太久了」不再在这里判：这里已经是出队执行的时候，
-            # 同一会话连发的第二条要等第一条跑完（10~30 秒）才走到这儿，
-            # 一判就是过期、直接丢掉 —— 用户看到的就是「连发两条只回一条」。
-            # 现在收到那一刻就判一次（见 on_message），进了队列就一定会回。
 
             is_group = username.endswith("@chatroom")
             nickname = ""
@@ -3268,7 +3273,19 @@ def main():
                     headers=headers,
                     timeout=120,
                 )
+                if r.status_code != 200:
+                    CONN_STATE["ok"] = False
+                    hint = "桥接 token 不匹配，请核对配置并重启桥接" if r.status_code in (401, 403) else "请查看内核诊断日志"
+                    log_throttled("webhook-http:" + str(r.status_code), "鲸鲸接口返回 HTTP %s：%s" % (r.status_code, hint))
+                    return
                 data = r.json()
+                if not isinstance(data, dict) or data.get("ok") is not True:
+                    CONN_STATE["ok"] = False
+                    log_throttled("webhook-response", "鲸鲸接口返回异常，未发送回复")
+                    return
+                if data.get("skipped") == "adapter_disabled":
+                    log_throttled("adapter-disabled", "微信网关未开启，请在启动器设置中开启 gateway.wechat.enabled")
+                    return
             except Exception as e:
                 _msg = repr(e)
                 if "10061" in _msg or "refused" in _msg.lower() or "积极拒绝" in _msg:
@@ -3297,7 +3314,12 @@ def main():
                 log("    去网页右上角「设置」填一把 Key（DeepSeek / 智谱 都行）就会切成真模型。")
 
             target = display_name(username)
-            bubbles = data.get("bubbles") or [data["reply"]]
+            bubbles = data.get("bubbles")
+            if not isinstance(bubbles, list):
+                bubbles = [data["reply"]]
+            bubbles = [line for line in bubbles if isinstance(line, str) and line.strip()]
+            if not bubbles:
+                bubbles = [str(data["reply"])]
             mention = str(data.get("mention") or "").strip()
             # 生成期间又来了新消息 → 这条旧回复就不发了（避免回上一句）
             # 不再因为“有新消息”丢掉旧回复：宁可晚一点，也要回
@@ -3324,7 +3346,9 @@ def main():
                     log("真 @ 失败，退回普通文本：", mention)
                     if not line.startswith("@"):
                         line = "@%s %s" % (mention, line)
-                send_text(line, target, username, quote_text=(content if first and QUOTE_REPLY else None))
+                if not send_text(line, target, username, quote_text=(content if first and QUOTE_REPLY else None)):
+                    log("文字发送失败，停止本次后续气泡和表情包：", target)
+                    return
                 first = False
                 time.sleep(0.6)
             # Stale/queued webhook payloads must claim a current-generation job;
@@ -3335,7 +3359,8 @@ def main():
         except Exception as e:
             log("处理消息异常：", repr(e))
 
-    wait_for_server(bot_url, timeout=30)
+    if not wait_for_server(bot_url, timeout=30):
+        return 2
     log("开始监听新消息…（Ctrl+C 退出）")
     pipeline = MessagePipeline(
         workers=PIPELINE_WORKERS,
@@ -3875,6 +3900,12 @@ def main():
             if mt <= last:
                 continue
             last = mt
+            current = read_config()
+            if (str(((current.get("gateway") or {}).get("wechat") or {}).get("inboundToken") or "") != str(token or "")
+                    or str((current.get("wechat") or {}).get("dbDir") or "") != str((cfg.get("wechat") or {}).get("dbDir") or "")
+                    or build_bot_url(current) != bot_url):
+                log("桥接连接设置变了，重新连接微信与内核…")
+                os._exit(7)
             if reload_config():
                 log("配置已热更新（调试台改完即时生效，不用重启桥接）")
 

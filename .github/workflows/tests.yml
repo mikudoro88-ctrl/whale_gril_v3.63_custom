@@ -142,6 +142,11 @@ jobs:
         if: always()
         run: dotnet build launcher/WhaleLauncher.csproj -c Release --nologo
 
+      - name: 启动器进程生命周期回归（模拟桥接）
+        if: always()
+        shell: pwsh
+        run: ./scripts/test-launcher.ps1
+
       - name: 启动冒烟（--doctor）
         if: always()
         run: node server.js --doctor

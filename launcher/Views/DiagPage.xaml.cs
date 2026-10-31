@@ -88,7 +88,7 @@ namespace WhaleLauncher.Views
                 : "不是管理员。微信若是管理员运行的，零焦点发送会被 UIPI 挡掉");
 
             AddCheck("UIA 可用", s.BrUia, s.BrUia ? "能读到微信窗口树" : "读不到：微信可能最小化，或桥接没起");
-            AddCheck("模型 Key", s.HasKey || s.Mock, s.Mock ? "演示模式（不连模型）" : (s.HasKey ? "已配置" : "去「设置」填 Key"));
+            AddCheck("模型 Key", !s.NeedsKey || s.HasKey || s.Mock, !s.NeedsKey ? "当前模型不需要 Key" : s.Mock ? "演示模式（不连模型）" : (s.HasKey ? "已配置" : "去「设置」填 Key"));
 
             var hasWheel = Directory.Exists(Path.Combine(_sup.BaseDir, "runtime", "wheelhouse"));
             if (hasWheel) AddCheck("打包完整性", false, "runtime\\wheelhouse 还在，安装包会白白大 117MB");

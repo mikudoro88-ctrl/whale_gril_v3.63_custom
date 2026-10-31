@@ -93,6 +93,13 @@ class ReminderService {
     }
   }
 
+  // 落盘失败就还原内存，不能向桥接交付没有持久化的任务。
+  commit(previous) {
+    if (this.save()) return;
+    this.items = previous;
+    throw Object.assign(new Error('提醒保存失败，请检查数据目录权限或磁盘空间'), { statusCode: 503 });
+  }
+
   activeOf(wxid) {
     return this.items.filter((it) => it.wxid === wxid && ACTIVE.has(it.status));
   }
@@ -148,9 +155,10 @@ class ReminderService {
       retryAt: 0,
       finishedAt: 0,
     };
+    const previous = JSON.parse(JSON.stringify(this.items));
     this.items.push(item);
     this.trim();
-    this.save();
+    this.commit(previous);
     return { ...item };
   }
 
@@ -176,13 +184,27 @@ class ReminderService {
    */
   expire(now = this.now(), { strict = false } = {}) {
     let expired = 0;
+    const previous = JSON.parse(JSON.stringify(this.items));
     for (const item of this.items) {
       if (!ACTIVE.has(item.status)) continue;
+      if (strict && now > Number(item.dueAt) + RETRY_DELAY_MS) {
+        item.status = 'expired';
+        item.error = '过了提醒时间，未发送（不补发）';
+        item.finishedAt = now;
+        expired += 1;
+        continue;
+      }
       if (item.status === 'sending') {
         if (now - Number(item.claimedAt || 0) > CLAIM_TIMEOUT_MS) {
+          item.attempts = Number(item.attempts || 0) + 1;
+          if (item.attempts >= 2) {
+            item.status = 'failed';
+            item.error = '发送回执超时，停止重试';
+            item.finishedAt = now;
+            continue;
+          }
           item.status = 'retrying';
           item.retryAt = now;
-          item.attempts = Number(item.attempts || 0) + 1;
         } else {
           continue;
         }
@@ -197,7 +219,7 @@ class ReminderService {
         expired += 1;
       }
     }
-    if (expired) this.save();
+    if (JSON.stringify(previous) !== JSON.stringify(this.items)) this.commit(previous);
     return { expired };
   }
 
@@ -218,6 +240,9 @@ class ReminderService {
     this.expire(now, { strict: false });
     const rules = this.rules(now);
     const out = [];
+    const previous = JSON.parse(JSON.stringify(this.items));
+    // 已领取但尚未回执的任务也占用每日额度，防止多轮领取超限。
+    const reserved = this.items.filter(it => it.status === 'sending').length;
     for (const item of this.items) {
       if (out.length >= limit) break;
       if (item.status !== 'pending' && item.status !== 'retrying') continue;
@@ -239,7 +264,7 @@ class ReminderService {
           continue;
         }
       }
-      if (rules.dailyCap && rules.sentToday + out.length >= rules.dailyCap) {
+      if (rules.dailyCap && rules.sentToday + reserved + out.length >= rules.dailyCap) {
         item.status = 'expired';
         item.error = `今天提醒次数已满（${rules.dailyCap} 次），不补发`;
         item.finishedAt = now;
@@ -249,7 +274,7 @@ class ReminderService {
       item.claimedAt = now;
       out.push({ ...item });
     }
-    if (out.length) this.save();
+    if (JSON.stringify(previous) !== JSON.stringify(this.items)) this.commit(previous);
     return out;
   }
 
@@ -272,6 +297,9 @@ class ReminderService {
   ack(id, { ok = false, error = '' } = {}) {
     const item = this.items.find((it) => it.id === String(id || ''));
     if (!item) return { ok: false, error: '找不到这条提醒', statusCode: 404 };
+    if (item.status === 'done' && ok) return { ok: true, item: { ...item } };
+    if (item.status !== 'sending') return { ok: false, error: '提醒已结束或尚未领取，不能更新回执', statusCode: 409 };
+    const previous = JSON.parse(JSON.stringify(this.items));
     const now = this.now();
     item.attempts = Number(item.attempts || 0) + 1;
     if (ok) {
@@ -287,7 +315,7 @@ class ReminderService {
       item.error = clean(error, 200) || '发送失败';
       item.finishedAt = now;
     }
-    this.save();
+    this.commit(previous);
     return { ok: true, item: { ...item } };
   }
 
@@ -295,9 +323,10 @@ class ReminderService {
     const item = this.items.find((it) => it.id === String(id || ''));
     if (!item) return { ok: false, error: '找不到这条提醒', statusCode: 404 };
     if (!ACTIVE.has(item.status)) return { ok: false, error: '这条提醒已经结束了', statusCode: 409 };
+    const previous = JSON.parse(JSON.stringify(this.items));
     item.status = 'cancelled';
     item.finishedAt = this.now();
-    this.save();
+    this.commit(previous);
     return { ok: true, item: { ...item } };
   }
 
